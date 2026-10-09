@@ -8,3 +8,4 @@ This file records all completed tasks and milestones implemented by the agent. E
 |---------|-------------|--------------------|----------------------|--------------|
 | **Task 0.1** | Initialize Go module `github.com/sdskill/archintel` and base clean architecture directory structure | `go.mod`, `cmd/`, `pkg/`, `tests/`, `pkg/model/doc.go` | Ran `go test ./...` -> Exited with code 0 (`github.com/sdskill/archintel/pkg/model`) | 2026-10-09 23:31 |
 | **Skill Install** | Install `ponytail` skill and rules suite from `DietrichGebert/ponytail` | `.agents/skills/`, `.agents/rules/ponytail.md`, `AGENTS.md` | Verified directory discovery in `.agents`, confirmed skills parsed, checked `git status` | 2026-10-09 23:37 |
+| **Task 1.1** | Define requirement domain models and helper methods | `pkg/model/requirements.go`, `pkg/model/requirements_test.go` | Ran `go test -v ./pkg/model/...` -> 3 tests passed (serialization, helpers, compliance) | 2026-10-09 23:40 |
