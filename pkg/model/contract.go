@@ -1,6 +1,10 @@
 package model
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
 
 // TopologyType specifies the recommended top-level application structure.
 type TopologyType string
@@ -62,8 +66,17 @@ type DataRules struct {
 	// RequiresOutboxPattern marks whether DB transactions writing events must use an outbox table.
 	RequiresOutboxPattern bool `json:"requires_outbox_pattern"`
 
+	// UniquenessStrategy defines database uniqueness mechanics (e.g. compound unique index).
+	UniquenessStrategy string `json:"uniqueness_strategy,omitempty"`
+
+	// ConflictHandling defines atomic conflict behavior (e.g. "ON CONFLICT DO NOTHING").
+	ConflictHandling string `json:"conflict_handling,omitempty"`
+
 	// ConnectionPoolMax recommended maximum open database connections.
 	ConnectionPoolMax int `json:"connection_pool_max"`
+
+	// PoolSizingRationale explains the mathematical or heuristic derivation of pool sizing.
+	PoolSizingRationale string `json:"pool_sizing_rationale,omitempty"`
 }
 
 // QueueRules governs background jobs, queue capacity, retries, and failure recovery.
@@ -74,8 +87,14 @@ type QueueRules struct {
 	// QueueMechanism recommended (e.g. "POSTGRES_SKIP_LOCKED", "REDIS_STREAMS", "DEDICATED_BROKER").
 	QueueMechanism string `json:"queue_mechanism,omitempty"`
 
+	// DeliveryGuarantee describes delivery semantics (e.g. "AT_LEAST_ONCE (handlers must be idempotent)").
+	DeliveryGuarantee string `json:"delivery_guarantee,omitempty"`
+
 	// MaxWorkerConcurrency is the bounded number of concurrent job workers.
 	MaxWorkerConcurrency int `json:"max_worker_concurrency,omitempty"`
+
+	// WorkerSizingRationale explains worker concurrency bounds based on CPU/IO expectations.
+	WorkerSizingRationale string `json:"worker_sizing_rationale,omitempty"`
 
 	// MaxRetryAttempts is the maximum retry count before routing to DLQ.
 	MaxRetryAttempts int `json:"max_retry_attempts,omitempty"`
@@ -173,5 +192,64 @@ func (c *ArchitectureContract) Validate() error {
 	if c.Data.IsolationLevel == "" {
 		return errors.New("data.isolation_level is required")
 	}
+	return c.ValidateConsistency()
+}
+
+// ValidateConsistency checks for internal contradictions within the contract.
+func (c *ArchitectureContract) ValidateConsistency() error {
+	// 1. Outbox contradiction check:
+	// If outbox pattern is NOT required, no component may claim to poll or dispatch an outbox table.
+	if !c.Data.RequiresOutboxPattern {
+		for _, comp := range c.Components {
+			if strings.Contains(strings.ToLower(comp.Name), "outbox") {
+				return fmt.Errorf("contract contradiction: component %q references outbox but data.requires_outbox_pattern is false", comp.Name)
+			}
+			for _, resp := range comp.Responsibilities {
+				if strings.Contains(strings.ToLower(resp), "outbox table") || strings.Contains(strings.ToLower(resp), "transactional outbox") {
+					return fmt.Errorf("contract contradiction: component %q responsibility %q references outbox but data.requires_outbox_pattern is false", comp.Name, resp)
+				}
+			}
+		}
+	}
+
+	// 2. Queue contradiction check:
+	// If queue is disabled, no worker component or queue poller should exist.
+	if !c.Queue.Enabled {
+		for _, comp := range c.Components {
+			if strings.Contains(strings.ToLower(comp.Name), "worker") || strings.Contains(strings.ToLower(comp.Name), "dispatcher") {
+				return fmt.Errorf("contract contradiction: component %q defined while queue.enabled is false", comp.Name)
+			}
+		}
+	}
+
+	// 3. Idempotency rule agreement:
+	// If requires_idempotency_key is true, an idempotency constraint must exist.
+	if c.Data.RequiresIdempotencyKey {
+		hasIdempConstraint := false
+		for _, rule := range c.Constraints {
+			if strings.Contains(strings.ToLower(rule.Rule), "idempotency") {
+				hasIdempConstraint = true
+				break
+			}
+		}
+		if !hasIdempConstraint {
+			return errors.New("contract contradiction: data.requires_idempotency_key is true but no idempotency constraint is defined")
+		}
+	}
+
+	// 4. Uniqueness constraint agreement:
+	if c.Data.UniquenessStrategy != "" {
+		hasUniqueConstraint := false
+		for _, rule := range c.Constraints {
+			if strings.Contains(strings.ToLower(rule.Rule), "unique") || strings.Contains(strings.ToLower(rule.Rule), "conflict") {
+				hasUniqueConstraint = true
+				break
+			}
+		}
+		if !hasUniqueConstraint {
+			return errors.New("contract contradiction: data.uniqueness_strategy is defined but no uniqueness constraint is included")
+		}
+	}
+
 	return nil
 }

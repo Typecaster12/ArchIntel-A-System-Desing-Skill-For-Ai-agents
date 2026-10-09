@@ -2,6 +2,9 @@ package validator
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 
 	"github.com/sdskill/archintel/pkg/model"
@@ -90,6 +93,9 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 	lowerContent := strings.ToLower(file.Content)
 	lowerPath := strings.ToLower(file.Path)
 
+	// Perform Go AST inspection if the file has valid Go syntax
+	v.inspectGoAST(file, report)
+
 	// Check 1: Synchronous external HTTP inside active DB transaction
 	if (strings.Contains(lowerContent, "tx.begin") || strings.Contains(lowerContent, "begintx")) &&
 		(strings.Contains(lowerContent, "http.get") || strings.Contains(lowerContent, "http.post") || strings.Contains(lowerContent, "client.do")) {
@@ -127,7 +133,7 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 		}
 	}
 
-	// Check 4: Unbounded goroutines in handlers
+	// Check 4: Unbounded goroutines in handlers (regex fallback)
 	if strings.Contains(lowerPath, "handler") && (strings.Contains(lowerContent, "go func(") || strings.Contains(lowerContent, "go handle")) {
 		if !strings.Contains(lowerContent, "semaphore") && !strings.Contains(lowerContent, "workerpool") && !strings.Contains(lowerContent, "pool.") {
 			report.Violations = append(report.Violations, Violation{
@@ -139,4 +145,59 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 			})
 		}
 	}
+
+	// Check 5: Non-atomic duplicate check / missing conflict handling
+	if contract.Data.UniquenessStrategy != "" {
+		if (strings.Contains(lowerContent, "insert into attendance") || strings.Contains(lowerContent, "insert into registration")) &&
+			!strings.Contains(lowerContent, "on conflict") && !strings.Contains(lowerContent, "for update") {
+			report.Violations = append(report.Violations, Violation{
+				RuleID:      "VIOL-NON-ATOMIC-DUPLICATE-CHECK",
+				Severity:    SeverityError,
+				File:        file.Path,
+				Message:     "Attendance or registration INSERT query lacks atomic 'ON CONFLICT' duplicate handling.",
+				Remediation: "Use database-level unique constraint with atomic conflict handling: 'INSERT INTO attendance (...) VALUES (...) ON CONFLICT (delegate_id, session_id) DO NOTHING'.",
+			})
+		}
+	}
+
+	// Check 6: Missing Idempotency Key validation in mutating handler
+	if contract.Data.RequiresIdempotencyKey && (strings.Contains(lowerPath, "handler") || strings.Contains(lowerPath, "controller")) {
+		if (strings.Contains(lowerContent, "checkin") || strings.Contains(lowerContent, "checkout") || strings.Contains(lowerContent, "register")) &&
+			!strings.Contains(lowerContent, "idempotency") && !strings.Contains(lowerContent, "x-idempotency") {
+			report.Violations = append(report.Violations, Violation{
+				RuleID:      "VIOL-MISSING-HANDLER-IDEMPOTENCY",
+				Severity:    SeverityWarning,
+				File:        file.Path,
+				Message:     "Mutating handler route does not extract or validate 'Idempotency-Key' header.",
+				Remediation: "Inspect 'Idempotency-Key' request header and verify against processed request store before executing mutations.",
+			})
+		}
+	}
+}
+
+// inspectGoAST parses valid Go source files into AST and detects concurrency anti-patterns.
+func (v *Validator) inspectGoAST(file CodeFileProposal, report *ValidationReport) {
+	if !strings.HasSuffix(file.Path, ".go") {
+		return
+	}
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, file.Path, file.Content, 0)
+	if err != nil {
+		return // Not parseable as standalone Go AST; regex inspections will cover it
+	}
+
+	ast.Inspect(node, func(n ast.Node) bool {
+		if _, ok := n.(*ast.GoStmt); ok {
+			if strings.Contains(strings.ToLower(file.Path), "handler") {
+				report.Violations = append(report.Violations, Violation{
+					RuleID:      "VIOL-AST-UNBOUNDED-GOROUTINE",
+					Severity:    SeverityWarning,
+					File:        file.Path,
+					Message:     "Go AST analysis detected direct 'go' goroutine dispatch in HTTP handler layer.",
+					Remediation: "Pass background tasks to a bounded worker pool or channel queue to prevent memory exhaustion.",
+				})
+			}
+		}
+		return true
+	})
 }

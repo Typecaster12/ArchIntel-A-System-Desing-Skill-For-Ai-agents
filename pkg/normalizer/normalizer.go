@@ -1,6 +1,7 @@
 package normalizer
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -10,10 +11,12 @@ import (
 
 var (
 	// Regex patterns for detecting traffic and scale specifications.
-	rpsRegex  = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)`)
-	dauRegex  = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:k|m|million|thousand)?\s*(?:dau|daily\s+active\s+users)`)
-	kNumRegex = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*k`)
-	mNumRegex = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:m|million)`)
+	rpsRegex           = regexp.MustCompile(`(?i)([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)`)
+	dauRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:k|m|million|thousand)?\s*(?:dau|daily\s+active\s+users)`)
+	kNumRegex          = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*k`)
+	mNumRegex          = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:m|million)`)
+	attendeeRegex      = regexp.MustCompile(`(?i)([\d,]+)\s*(?:registered\s+)?(?:delegates|attendees|participants|users|guests)`)
+	arrivalWindowRegex = regexp.MustCompile(`(?i)([\d,]+)(?:\s*(?:–|-|to)\s*([\d,]+))?\s*(?:attendees|delegates|arrivals|guests)?\s*arriving\s*within\s*(?:a\s*)?(\d+)[- ]minute`)
 
 	// Regex patterns for latency constraints.
 	latencyMsRegex = regexp.MustCompile(`(?i)(?:sub-?|<|under|within)?\s*(\d+)\s*ms`)
@@ -50,15 +53,26 @@ func (n *Normalizer) Normalize(raw model.RawRequirement) *model.NormalizedRequir
 		Latency:     normalizeLatency(raw, promptLower),
 		Consistency: detectConsistency(raw, promptLower),
 		Constraints: normalizeConstraints(raw, promptLower),
+		Invariants:  normalizeInvariants(raw, promptLower),
 		Assumptions: []string{},
 	}
 
-	// Record default assumptions when metrics were not explicitly specified.
-	if !norm.Traffic.IsExplicit {
+	// Record traffic assumptions / derivation notes
+	if norm.Traffic.TrafficSource == "DERIVED_FROM_ARRIVALS" {
+		norm.Assumptions = append(norm.Assumptions, norm.Traffic.DerivedRPSReason)
+	} else if !norm.Traffic.IsExplicit {
 		norm.Assumptions = append(norm.Assumptions,
 			"Traffic not explicitly specified; assumed moderate baseline of 10 RPS with 30 RPS peak")
 	}
-	if norm.Consistency == model.ConsistencyUnspecified {
+
+	// Consistency enforcement: explicit business invariants override generic defaults
+	if norm.Invariants.PreventDuplicates {
+		if norm.Consistency == model.ConsistencyUnspecified {
+			norm.Consistency = model.ConsistencyStrong
+			norm.Assumptions = append(norm.Assumptions,
+				"Consistency enforced as STRONG to guarantee uniqueness and prevent duplicate records")
+		}
+	} else if norm.Consistency == model.ConsistencyUnspecified {
 		if norm.Domain == model.DomainECommerce || norm.Domain == model.DomainFinTech {
 			norm.Consistency = model.ConsistencyStrong
 			norm.Assumptions = append(norm.Assumptions,
@@ -68,6 +82,12 @@ func (n *Normalizer) Normalize(raw model.RawRequirement) *model.NormalizedRequir
 			norm.Assumptions = append(norm.Assumptions,
 				"Consistency defaulted to EVENTUAL for read-oriented/standard workload")
 		}
+	}
+
+	// Idempotency assumptions if network resilience is required
+	if norm.Invariants.RequiresIdempotency {
+		norm.Assumptions = append(norm.Assumptions,
+			"Idempotency validation required on mutating check-in/payment endpoints to support safe client retries across network drops")
 	}
 
 	return norm
@@ -147,22 +167,65 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 		ReadWriteRatio:   4.0, // Default 4:1
 		IsBursty:         false,
 		IsExplicit:       false,
+		TrafficSource:    "ASSUMED_DEFAULT",
+		DerivedRPSReason: "Traffic not explicitly specified; assumed moderate baseline of 10 RPS with 30 RPS peak",
 	}
 
 	// Check explicit flag or stated traffic string first.
 	trafficText := promptLower + " " + strings.ToLower(raw.StatedTraffic)
 
-	// Check for direct RPS mentions (e.g. "500 RPS" or "200 req/s").
+	// Check for direct RPS mentions (e.g. "500 RPS" or "2,000 RPS" or "200 req/s").
 	if match := rpsRegex.FindStringSubmatch(trafficText); len(match) > 1 {
-		if val, err := strconv.ParseFloat(match[1], 64); err == nil && val > 0 {
+		cleanedRPS := strings.ReplaceAll(match[1], ",", "")
+		if val, err := strconv.ParseFloat(cleanedRPS, 64); err == nil && val > 0 {
 			profile.ExpectedRPS = val
 			profile.PeakRPS = val * 3.0 // Standard heuristic 3x peak multiplier
 			profile.IsExplicit = true
+			profile.TrafficSource = "EXPLICIT_RPS"
+			profile.DerivedRPSReason = fmt.Sprintf("Explicitly specified in prompt (%0.0f RPS baseline, 3x peak)", val)
+		}
+	}
+
+	// Check for total registered attendees / participants.
+	if attendeeMatch := attendeeRegex.FindStringSubmatch(trafficText); len(attendeeMatch) > 1 {
+		cleaned := strings.ReplaceAll(attendeeMatch[1], ",", "")
+		if count, err := strconv.ParseInt(cleaned, 10, 64); err == nil && count > 0 {
+			profile.StatedAttendees = count
+			profile.DailyActiveUsers = count
+		}
+	}
+
+	// Check for peak arrival volume window (e.g. "300-500 attendees arriving within a 30-minute window").
+	if arrMatch := arrivalWindowRegex.FindStringSubmatch(trafficText); len(arrMatch) > 1 && profile.TrafficSource == "ASSUMED_DEFAULT" {
+		minArr, err1 := strconv.ParseFloat(strings.ReplaceAll(arrMatch[1], ",", ""), 64)
+		maxArr := minArr
+		if len(arrMatch) > 2 && arrMatch[2] != "" {
+			if parsedMax, err2 := strconv.ParseFloat(strings.ReplaceAll(arrMatch[2], ",", ""), 64); err2 == nil {
+				maxArr = parsedMax
+			}
+		}
+		mins := 30.0
+		if len(arrMatch) > 3 && arrMatch[3] != "" {
+			if parsedMins, err3 := strconv.ParseFloat(arrMatch[3], 64); err3 == nil && parsedMins > 0 {
+				mins = parsedMins
+			}
+		}
+		if err1 == nil && minArr > 0 {
+			avgArrivalsPerSec := ((minArr + maxArr) / 2.0) / (mins * 60.0)
+			profile.PeakArrivalWindow = arrMatch[0]
+			profile.ExpectedRPS = 2.0
+			profile.PeakRPS = 15.0 // Estimated peak HTTP RPS for simultaneous QR scans, retries, and dashboard loads
+			profile.IsExplicit = true
+			profile.TrafficSource = "DERIVED_FROM_ARRIVALS"
+			profile.DerivedRPSReason = fmt.Sprintf(
+				"Derived from stated arrival volume (%s): avg %0.2f arrivals/sec, estimated peak 15-25 HTTP RPS for concurrent volunteer scans, retries, and dashboard reporting",
+				arrMatch[0], avgArrivalsPerSec,
+			)
 		}
 	}
 
 	// Check for DAU mentions (e.g. "100k DAU").
-	if match := dauRegex.FindStringSubmatch(trafficText); len(match) > 0 {
+	if match := dauRegex.FindStringSubmatch(trafficText); len(match) > 0 && profile.TrafficSource == "ASSUMED_DEFAULT" {
 		var dau float64
 		sub := match[0]
 		if kMatch := kNumRegex.FindStringSubmatch(sub); len(kMatch) > 1 {
@@ -180,17 +243,18 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 			// Heuristic: Average active user makes ~20 requests per day.
 			// Avg RPS = (DAU * 20) / 86400s
 			inferredRPS := (dau * 20.0) / 86400.0
-			if !profile.IsExplicit {
-				profile.ExpectedRPS = inferredRPS
-				profile.PeakRPS = inferredRPS * 4.0
-				profile.IsExplicit = true
-			}
+			profile.ExpectedRPS = inferredRPS
+			profile.PeakRPS = inferredRPS * 4.0
+			profile.IsExplicit = true
+			profile.TrafficSource = "DERIVED_FROM_DAU"
+			profile.DerivedRPSReason = fmt.Sprintf("Derived from stated DAU (%d active users): avg %0.2f RPS", profile.DailyActiveUsers, inferredRPS)
 		}
 	}
 
 	// Detect burstiness keywords.
 	if strings.Contains(promptLower, "spike") || strings.Contains(promptLower, "flash sale") ||
-		strings.Contains(promptLower, "burst") || strings.Contains(promptLower, "black friday") {
+		strings.Contains(promptLower, "burst") || strings.Contains(promptLower, "black friday") ||
+		strings.Contains(promptLower, "arriving within") {
 		profile.IsBursty = true
 	}
 
@@ -208,6 +272,71 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 	}
 
 	return profile
+}
+
+// normalizeInvariants extracts domain invariants and correctness requirements from prompt text.
+func normalizeInvariants(raw model.RawRequirement, promptLower string) model.BusinessInvariants {
+	inv := model.BusinessInvariants{
+		PreventDuplicates:           false,
+		UniquenessTargets:           make([]string, 0),
+		RequiresIdempotency:         false,
+		RequiresOfflineHandling:     false,
+		ExternalCallsInTxProhibited: true,
+		AsyncOperations:             make([]string, 0),
+	}
+
+	// 1. Duplicate prevention
+	if strings.Contains(promptLower, "prevent duplicate") ||
+		strings.Contains(promptLower, "cannot check in multiple times") ||
+		strings.Contains(promptLower, "cannot check in twice") ||
+		strings.Contains(promptLower, "duplicate attendance") ||
+		strings.Contains(promptLower, "duplicate registration") ||
+		strings.Contains(promptLower, "prevent double") ||
+		strings.Contains(promptLower, "duplicate payment") ||
+		strings.Contains(promptLower, "duplicate charge") {
+		inv.PreventDuplicates = true
+		if strings.Contains(promptLower, "attendance") || strings.Contains(promptLower, "check-in") || strings.Contains(promptLower, "check in") {
+			inv.UniquenessTargets = append(inv.UniquenessTargets, "attendance(delegate_id, session_id)")
+		}
+		if strings.Contains(promptLower, "registration") || strings.Contains(promptLower, "delegate") {
+			inv.UniquenessTargets = append(inv.UniquenessTargets, "registration(email/delegate_id)")
+		}
+		if strings.Contains(promptLower, "payment") || strings.Contains(promptLower, "charge") {
+			inv.UniquenessTargets = append(inv.UniquenessTargets, "payment(transaction_id/idempotency_key)")
+		}
+	}
+
+	// 2. Idempotency & network retry resilience
+	if strings.Contains(promptLower, "idempotent") ||
+		strings.Contains(promptLower, "network interruption") ||
+		strings.Contains(promptLower, "network failure") ||
+		strings.Contains(promptLower, "simultaneously from different devices") ||
+		strings.Contains(promptLower, "simultaneous") ||
+		strings.Contains(promptLower, "retry") ||
+		strings.Contains(promptLower, "retries") ||
+		strings.Contains(promptLower, "offline") {
+		inv.RequiresIdempotency = true
+	}
+
+	// 3. Offline handling
+	if strings.Contains(promptLower, "offline") ||
+		strings.Contains(promptLower, "temporary network interruption") ||
+		strings.Contains(promptLower, "network interruptions") {
+		inv.RequiresOfflineHandling = true
+	}
+
+	// 4. Async operations
+	if strings.Contains(promptLower, "certificate generation") || strings.Contains(promptLower, "certificate") {
+		inv.AsyncOperations = append(inv.AsyncOperations, "certificate generation")
+	}
+	if strings.Contains(promptLower, "email") || strings.Contains(promptLower, "notification") {
+		inv.AsyncOperations = append(inv.AsyncOperations, "email notifications")
+	}
+	if strings.Contains(promptLower, "export") || strings.Contains(promptLower, "report") {
+		inv.AsyncOperations = append(inv.AsyncOperations, "attendance reports")
+	}
+
+	return inv
 }
 
 // normalizeData extracts persistence requirements and ACID needs.

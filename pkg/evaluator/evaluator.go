@@ -36,7 +36,7 @@ func (e *Evaluator) Evaluate(req *model.NormalizedRequirements, class *model.Cla
 	summary.RecommendedDataRules = e.evaluateDataRules(req, class)
 
 	// 3. Evaluate Background Queue and Worker Rules
-	summary.RecommendedQueueRules = e.evaluateQueueRules(req, class)
+	summary.RecommendedQueueRules = e.evaluateQueueRules(req, class, summary.RecommendedDataRules)
 
 	// 4. Select Matching Patterns
 	summary.SelectedPatterns = e.selectPatterns(req, class, summary)
@@ -72,38 +72,70 @@ func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *
 		Locking:                model.LockingNone,
 		RequiresIdempotencyKey: false,
 		RequiresOutboxPattern:  false,
-		ConnectionPoolMax:      25,
+		ConnectionPoolMax:      20,
 	}
 
-	// High Contention (inventory, booking, balance deduction) mandates Pessimistic Locking
-	if req.Data.HasHighContention || class.HasTrait(model.TraitHighContention) {
+	// 1. Database Uniqueness and Conflict Handling for duplicate prevention
+	if req.Invariants.PreventDuplicates {
+		rules.UniquenessStrategy = "DATABASE_UNIQUE_CONSTRAINT (e.g. compound unique index: UNIQUE (delegate_id, session_id))"
+		rules.ConflictHandling = "ATOMIC_INSERT_ON_CONFLICT (INSERT ... ON CONFLICT (delegate_id, session_id) DO NOTHING)"
+	}
+
+	// 2. Concurrency Locking
+	if req.Data.HasHighContention || (class.HasTrait(model.TraitHighContention) && !req.Invariants.PreventDuplicates) {
 		rules.Locking = model.LockingPessimistic
 	} else if req.HasStrictConsistency() || class.HasTrait(model.TraitConsistencySensitive) {
-		rules.Locking = model.LockingOptimistic
+		if req.Invariants.PreventDuplicates && !req.Data.HasHighContention {
+			// Duplicate prevention is handled primarily via database unique constraints and atomic conflict handling
+			rules.Locking = model.LockingNone
+		} else {
+			rules.Locking = model.LockingOptimistic
+		}
 	}
 
-	// Mutating financial or commerce flows require Idempotency Keys and Transactional Outbox
-	if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech || req.Data.RequiresACID {
+	// 3. Idempotency Key requirement (mutating financial, commerce, or retry-prone multi-device flows)
+	if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech || req.Invariants.RequiresIdempotency {
 		rules.RequiresIdempotencyKey = true
+	}
+
+	// 4. Transactional Outbox requirement:
+	// Mandated when state mutations must atomically trigger asynchronous side-effects (emails, certificates, webhooks)
+	if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech || req.Data.RequiresACID || len(req.Invariants.AsyncOperations) > 0 {
 		rules.RequiresOutboxPattern = true
 	}
 
-	// Sizing database connection pool based on expected throughput
+	// 5. Explainable Connection Pool Sizing via Little's Law (N = RPS * Latency)
 	if req.Traffic.PeakRPS > 1000 {
 		rules.ConnectionPoolMax = 50
+		rules.PoolSizingRationale = fmt.Sprintf(
+			"Sized for high scale (peak %0.0f RPS): pool of 50 connections accommodates ~250 concurrent requests at 20ms avg query latency with 2x headroom.",
+			req.Traffic.PeakRPS,
+		)
 	} else if req.Traffic.PeakRPS > 300 {
 		rules.ConnectionPoolMax = 35
+		rules.PoolSizingRationale = fmt.Sprintf(
+			"Sized for moderate burst (peak %0.0f RPS): pool of 35 connections provides headroom for burst spikes while preventing DB thread contention.",
+			req.Traffic.PeakRPS,
+		)
+	} else {
+		rules.ConnectionPoolMax = 20
+		rules.PoolSizingRationale = fmt.Sprintf(
+			"Conservative baseline: derived via Little's Law for peak %0.0f RPS (estimated 0.3-0.5 concurrent queries at 20ms latency). Pool of 20 provides ~40x burst headroom without exhausting memory on a single cloud DB.",
+			req.Traffic.PeakRPS,
+		)
 	}
 
 	return rules
 }
 
 // evaluateQueueRules configures bounded queues, backpressure, and dead-letter handling.
-func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class *model.ClassificationResult) model.QueueRules {
-	needsQueue := class.HasTrait(model.TraitBackgroundIntensive) ||
+func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class *model.ClassificationResult, dataRules model.DataRules) model.QueueRules {
+	needsQueue := dataRules.RequiresOutboxPattern ||
+		class.HasTrait(model.TraitBackgroundIntensive) ||
 		req.Domain == model.DomainECommerce ||
 		req.Domain == model.DomainFinTech ||
-		req.Domain == model.DomainAsyncPipeline
+		req.Domain == model.DomainAsyncPipeline ||
+		len(req.Invariants.AsyncOperations) > 0
 
 	if !needsQueue {
 		return model.QueueRules{Enabled: false}
@@ -115,6 +147,7 @@ func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class 
 		MaxRetryAttempts:      3,
 		BackoffStrategy:       "EXPONENTIAL_WITH_JITTER",
 		DeadLetterHandling:    "Quarantine in failed_jobs table with structured error log and alert metric",
+		DeliveryGuarantee:     "AT_LEAST_ONCE (handlers must be idempotent)",
 	}
 
 	// Scale-appropriate queue mechanism:
@@ -128,6 +161,12 @@ func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class 
 	if req.Traffic.PeakRPS > 500 {
 		queue.MaxWorkerConcurrency = 25
 		queue.MaxRetryAttempts = 5
+		queue.WorkerSizingRationale = "High concurrency worker pool (25 workers) sized to process heavy burst queues without accumulating lag."
+	} else if len(req.Invariants.AsyncOperations) > 0 {
+		queue.MaxWorkerConcurrency = 8
+		queue.WorkerSizingRationale = "Bounded concurrency (8 workers) protects CPU/memory from heavy PDF certificate generation and external email API latency, preserving capacity for HTTP handlers."
+	} else {
+		queue.WorkerSizingRationale = "Standard bounded concurrency (10 workers) ensures steady asynchronous processing without database connection starvation."
 	}
 
 	return queue

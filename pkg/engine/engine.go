@@ -69,6 +69,7 @@ type AnalysisResponse struct {
 
 // RecommendationResponse holds the full architectural recommendation and contract.
 type RecommendationResponse struct {
+	Normalized           *model.NormalizedRequirements `json:"normalized"`
 	Contract             *model.ArchitectureContract   `json:"contract"`
 	Classification       *model.ClassificationResult   `json:"classification"`
 	Gaps                 *normalizer.GapAnalysis       `json:"gaps"`
@@ -136,6 +137,7 @@ func (e *Engine) RecommendArchitecture(ctx context.Context, raw model.RawRequire
 	)
 
 	return &RecommendationResponse{
+		Normalized:           norm,
 		Contract:             archContract,
 		Classification:       class,
 		Gaps:                 gaps,

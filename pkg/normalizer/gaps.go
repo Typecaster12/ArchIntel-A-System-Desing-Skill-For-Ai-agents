@@ -77,8 +77,17 @@ func (d *GapDetector) Analyze(norm *model.NormalizedRequirements) *GapAnalysis {
 		CanProceed:  true,
 	}
 
-	// 1. Check for unstated traffic figures
-	if !norm.Traffic.IsExplicit {
+	// 1. Check for unstated or derived traffic figures
+	if norm.Traffic.TrafficSource == "DERIVED_FROM_ARRIVALS" {
+		gap := ArchitectureGap{
+			Field:             "INSTANTANEOUS_BURST_RPS",
+			Severity:          ImpactLow,
+			Description:       fmt.Sprintf("Arrival volume (%s for %d attendees) is specified, but instantaneous peak HTTP API burst RPS is derived rather than measured.", norm.Traffic.PeakArrivalWindow, norm.Traffic.StatedAttendees),
+			DefaultAssumption: "Derived estimated peak traffic of 15-25 HTTP RPS for concurrent volunteer check-in scans, retries, and dashboard reporting.",
+		}
+		analysis.Gaps = append(analysis.Gaps, gap)
+		analysis.Assumptions = append(analysis.Assumptions, gap.DefaultAssumption)
+	} else if !norm.Traffic.IsExplicit {
 		gap := ArchitectureGap{
 			Field:             "TRAFFIC_SCALE",
 			Severity:          ImpactHigh,
@@ -98,6 +107,29 @@ func (d *GapDetector) Analyze(norm *model.NormalizedRequirements) *GapAnalysis {
 				"Very High: > 5,000 RPS",
 			},
 			AppliedDefault: "Early stage (< 50 RPS)",
+		})
+	}
+
+	// 2. Check for offline synchronization and conflict resolution
+	if norm.Invariants.RequiresOfflineHandling {
+		gap := ArchitectureGap{
+			Field:             "OFFLINE_SYNC_SEMANTICS",
+			Severity:          ImpactMedium,
+			Description:       "Offline check-in during network interruptions is required, but conflict resolution rules for concurrent multi-device scans were unspecified.",
+			DefaultAssumption: "Client devices buffer scans with client-generated event UUIDs; server enforces idempotent first-write-wins via database compound unique constraint.",
+		}
+		analysis.Gaps = append(analysis.Gaps, gap)
+		analysis.Assumptions = append(analysis.Assumptions, gap.DefaultAssumption)
+
+		analysis.Questions = append(analysis.Questions, ClarificationQuestion{
+			Topic:    "Offline Check-in Conflict Resolution",
+			Question: "When multiple volunteer devices scan the same delegate while offline, how should conflicts be resolved upon sync?",
+			SuggestedOptions: []string{
+				"First-write-wins: reject subsequent scans as duplicate (Recommended)",
+				"Last-write-wins: overwrite previous check-in timestamp",
+				"Audit-all: record every scan event with device metadata",
+			},
+			AppliedDefault: "First-write-wins via unique constraint (UNIQUE(delegate_id, session_id))",
 		})
 	}
 

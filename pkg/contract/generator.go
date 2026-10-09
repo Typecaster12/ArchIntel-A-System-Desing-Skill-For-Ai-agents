@@ -71,14 +71,21 @@ func (g *Generator) buildComponents(req *model.NormalizedRequirements, summary *
 	// Add Background / Outbox Worker if queue or outbox is active
 	if summary.RecommendedDataRules.RequiresOutboxPattern || summary.RecommendedQueueRules.Enabled {
 		workerName := "AsyncWorker"
-		responsibilities := []string{
-			"Poll queued tasks and transactional outbox table",
-			"Dispatch asynchronous notifications and external webhooks",
-			"Record execution status and route persistent failures to Dead-Letter Queue",
-		}
+		var responsibilities []string
 
 		if summary.RecommendedDataRules.RequiresOutboxPattern {
 			workerName = "OutboxDispatcherWorker"
+			responsibilities = []string{
+				"Poll pending events from transactional outbox table",
+				"Dispatch asynchronous notifications and external webhooks with retry backoff",
+				"Mark processed outbox records and route persistent failures to Dead-Letter Queue",
+			}
+		} else {
+			responsibilities = []string{
+				"Poll queued background jobs from database job table",
+				"Execute asynchronous tasks (e.g. notifications, exports) using bounded concurrency",
+				"Record execution status and route persistent failures to Dead-Letter Queue",
+			}
 		}
 
 		components = append(components, model.ComponentDefinition{
@@ -112,7 +119,17 @@ func (g *Generator) buildConstraints(summary *evaluator.DecisionSummary) []model
 		Rationale: "Unbounded concurrency during traffic bursts exhausts memory, CPU, and database connection limits.",
 	})
 
-	// 3. Idempotency Key requirement
+	// 3. Database Uniqueness & Atomic Conflict Handling
+	if summary.RecommendedDataRules.UniquenessStrategy != "" {
+		constraints = append(constraints, model.ImplementationConstraint{
+			Rule:      "Enforce compound database unique constraint (e.g. UNIQUE (delegate_id, session_id)) with atomic ON CONFLICT handling on mutating records",
+			Category:  "DATABASE",
+			Severity:  "ERROR",
+			Rationale: "Guarantees absolute protection against duplicate attendance/registration writes across concurrent client requests without relying on application-level read-then-write checks.",
+		})
+	}
+
+	// 4. Idempotency Key requirement
 	if summary.RecommendedDataRules.RequiresIdempotencyKey {
 		constraints = append(constraints, model.ImplementationConstraint{
 			Rule:      "All mutating transactional endpoints must require and validate an 'Idempotency-Key' header",
@@ -122,7 +139,7 @@ func (g *Generator) buildConstraints(summary *evaluator.DecisionSummary) []model
 		})
 	}
 
-	// 4. Concurrency Locking requirement
+	// 5. Concurrency Locking requirement
 	if summary.RecommendedDataRules.Locking == model.LockingPessimistic {
 		constraints = append(constraints, model.ImplementationConstraint{
 			Rule:      "Use 'SELECT ... FOR UPDATE' with deterministic row ordering on mutable inventory/balance records",
@@ -132,7 +149,7 @@ func (g *Generator) buildConstraints(summary *evaluator.DecisionSummary) []model
 		})
 	}
 
-	// 5. Queue row-locking requirement
+	// 6. Queue row-locking requirement
 	if summary.RecommendedQueueRules.QueueMechanism == "POSTGRES_SKIP_LOCKED" {
 		constraints = append(constraints, model.ImplementationConstraint{
 			Rule:      "Worker queries fetching background jobs must use 'SELECT ... FOR UPDATE SKIP LOCKED'",
@@ -160,6 +177,14 @@ func (g *Generator) buildValidationCriteria(summary *evaluator.DecisionSummary) 
 		Description: "Verify all background worker loops use a bounded channel buffer or worker pool",
 		IsAutomated: true,
 	})
+
+	if summary.RecommendedDataRules.UniquenessStrategy != "" {
+		criteria = append(criteria, model.ValidationCriterion{
+			Identifier:  "CHK-UNIQUE-CONSTRAINTS",
+			Description: "Verify database schema defines compound UNIQUE constraint and atomic conflict handling",
+			IsAutomated: true,
+		})
+	}
 
 	if summary.RecommendedDataRules.RequiresIdempotencyKey {
 		criteria = append(criteria, model.ValidationCriterion{

@@ -63,6 +63,18 @@ type TrafficProfile struct {
 
 	// IsExplicit indicates if these traffic figures were directly specified by the user.
 	IsExplicit bool `json:"is_explicit"`
+
+	// StatedAttendees is the total registered attendee or user count mentioned in requirements.
+	StatedAttendees int64 `json:"stated_attendees,omitempty"`
+
+	// PeakArrivalWindow is the arrival window text if specified (e.g. "300-500 attendees in 30 minutes").
+	PeakArrivalWindow string `json:"peak_arrival_window,omitempty"`
+
+	// DerivedRPSReason explains how RPS was calculated from stated figures or defaults.
+	DerivedRPSReason string `json:"derived_rps_reason,omitempty"`
+
+	// TrafficSource indicates whether traffic was EXPLICIT_RPS, DERIVED_FROM_ARRIVALS, or ASSUMED_DEFAULT.
+	TrafficSource string `json:"traffic_source,omitempty"`
 }
 
 // DataProfile describes storage volume, schema nature, and database guarantees.
@@ -122,6 +134,27 @@ type InferredTrait struct {
 	Confidence float64 `json:"confidence"`
 }
 
+// BusinessInvariants captures domain invariants and correctness rules explicitly stated in the requirements.
+type BusinessInvariants struct {
+	// PreventDuplicates is true if unique records (e.g. attendance, registration, payment) must be guaranteed.
+	PreventDuplicates bool `json:"prevent_duplicates"`
+
+	// UniquenessTargets lists entities requiring database uniqueness (e.g. "attendance(delegate_id, session_id)").
+	UniquenessTargets []string `json:"uniqueness_targets,omitempty"`
+
+	// RequiresIdempotency is true if mutating operations need idempotency keys for safe retries.
+	RequiresIdempotency bool `json:"requires_idempotency"`
+
+	// RequiresOfflineHandling is true if client operations must buffer locally and sync later.
+	RequiresOfflineHandling bool `json:"requires_offline_handling"`
+
+	// ExternalCallsInTxProhibited is true if network calls must not block DB transactions.
+	ExternalCallsInTxProhibited bool `json:"external_calls_in_tx_prohibited"`
+
+	// AsyncOperations lists background jobs to decouple (e.g. "certificate generation", "bulk email").
+	AsyncOperations []string `json:"async_operations,omitempty"`
+}
+
 // NormalizedRequirements is the canonical internal representation of project requirements.
 // It explicitly distinguishes stated facts from inferred traits and default assumptions.
 type NormalizedRequirements struct {
@@ -148,6 +181,9 @@ type NormalizedRequirements struct {
 
 	// Constraints lists technology and deployment limitations.
 	Constraints Constraints `json:"constraints"`
+
+	// Invariants captures explicit business invariants that must not be overridden by generic heuristics.
+	Invariants BusinessInvariants `json:"invariants"`
 
 	// InferredTraits lists traits derived automatically from the prompt.
 	InferredTraits []InferredTrait `json:"inferred_traits"`

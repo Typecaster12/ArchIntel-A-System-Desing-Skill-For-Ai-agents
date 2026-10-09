@@ -81,8 +81,9 @@ func (a *LayaAdapter) Classify(ctx context.Context, req *model.NormalizedRequire
 		if err != nil {
 			return nil, err
 		}
+		res.Source = model.ClassifierSourceRuleBased
 		res.FallbackApplied = true
-		res.ModelVersion = "fallback: laya unconfigured"
+		res.ModelVersion = "deterministic rule-based heuristics (LAYA service unconfigured; running standalone deterministic engine)"
 		return res, nil
 	}
 
@@ -173,7 +174,8 @@ func (a *LayaAdapter) executeFallback(ctx context.Context, req *model.Normalized
 	if err != nil {
 		return nil, err
 	}
+	res.Source = model.ClassifierSourceRuleBased
 	res.FallbackApplied = true
-	res.ModelVersion = fmt.Sprintf("fallback: %s", reason)
+	res.ModelVersion = fmt.Sprintf("fallback to deterministic heuristics: %s", reason)
 	return res, nil
 }

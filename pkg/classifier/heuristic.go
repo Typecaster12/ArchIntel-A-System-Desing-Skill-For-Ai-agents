@@ -2,6 +2,8 @@ package classifier
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sdskill/archintel/pkg/model"
@@ -188,6 +190,9 @@ func evaluateLatencySensitive(req *model.NormalizedRequirements) (float64, strin
 }
 
 func evaluateBackgroundIntensive(req *model.NormalizedRequirements) (float64, string) {
+	if len(req.Invariants.AsyncOperations) > 0 {
+		return 0.85, fmt.Sprintf("Explicit asynchronous operations requested: %s", strings.Join(req.Invariants.AsyncOperations, ", "))
+	}
 	if req.Domain == model.DomainAsyncPipeline || req.Domain == model.DomainAnalytics {
 		return 0.90, "Pipeline or analytics workload dominated by async batch execution"
 	}
@@ -198,6 +203,9 @@ func evaluateBackgroundIntensive(req *model.NormalizedRequirements) (float64, st
 }
 
 func evaluateConsistencySensitive(req *model.NormalizedRequirements) (float64, string) {
+	if req.Invariants.PreventDuplicates {
+		return 0.95, "Explicit invariant: duplicate prevention required on authoritative attendance/registration records"
+	}
 	if req.Consistency == model.ConsistencyStrong || req.Consistency == model.ConsistencyLinearizable {
 		return 0.95, "Strong or linearizable consistency explicitly mandated"
 	}
@@ -209,7 +217,7 @@ func evaluateConsistencySensitive(req *model.NormalizedRequirements) (float64, s
 
 func evaluateBurstyTraffic(req *model.NormalizedRequirements) (float64, string) {
 	if req.Traffic.IsBursty {
-		return 0.90, "Traffic spikes explicitly expected (e.g. flash sales or marketing events)"
+		return 0.90, "Traffic spikes explicitly expected (e.g. arrivals within window or flash sales)"
 	}
 	if req.Traffic.PeakRPS >= req.Traffic.ExpectedRPS*3.0 && req.Traffic.PeakRPS > 100 {
 		return 0.75, "Peak throughput is 3x or greater than baseline RPS"
@@ -220,6 +228,9 @@ func evaluateBurstyTraffic(req *model.NormalizedRequirements) (float64, string) 
 func evaluateHighContention(req *model.NormalizedRequirements) (float64, string) {
 	if req.Data.HasHighContention {
 		return 0.95, "Shared mutable state (inventory/seats/balances) accessed concurrently"
+	}
+	if req.Invariants.RequiresIdempotency && req.Invariants.PreventDuplicates {
+		return 0.75, "Concurrent check-in/scan operations from multiple devices target shared attendance records"
 	}
 	return 0.15, "Requests operate on isolated, user-owned entities without contention"
 }

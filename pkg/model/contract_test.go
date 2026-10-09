@@ -56,6 +56,12 @@ func TestContractJSONSerializationAndValidation(t *testing.T) {
 				Severity:  "ERROR",
 				Rationale: "External network latency holds database connection open, risking pool exhaustion",
 			},
+			{
+				Rule:      "All mutating transactional endpoints must require and validate an 'Idempotency-Key' header",
+				Category:  "API_DESIGN",
+				Severity:  "ERROR",
+				Rationale: "Guarantees safe client retries without creating duplicate orders or double-spending financial balances",
+			},
 		},
 		RejectedAlternatives: []RejectedAlternative{
 			{
@@ -133,6 +139,28 @@ func TestContractValidationErrors(t *testing.T) {
 				c.Data.IsolationLevel = ""
 			},
 			wantErr: "data.isolation_level is required",
+		},
+		{
+			name: "Outbox Contradiction: outbox worker defined when outbox is false",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresOutboxPattern = false
+				c.Components = append(c.Components, ComponentDefinition{
+					Name: "OutboxDispatcherWorker",
+					Responsibilities: []string{"Poll transactional outbox table"},
+				})
+			},
+			wantErr: "contract contradiction: component \"OutboxDispatcherWorker\" references outbox but data.requires_outbox_pattern is false",
+		},
+		{
+			name: "Queue Contradiction: worker defined when queue is disabled",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = false
+				c.Components = append(c.Components, ComponentDefinition{
+					Name: "AsyncWorker",
+					Responsibilities: []string{"Process background tasks"},
+				})
+			},
+			wantErr: "contract contradiction: component \"AsyncWorker\" defined while queue.enabled is false",
 		},
 	}
 
