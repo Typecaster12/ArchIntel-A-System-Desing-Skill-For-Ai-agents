@@ -17,6 +17,7 @@ var (
 
 	// Regex patterns for latency constraints.
 	latencyMsRegex = regexp.MustCompile(`(?i)(?:sub-?|<|under|within)?\s*(\d+)\s*ms`)
+	ratioRegex     = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*(?:read(?:\s*to|\s*-|\s*\/)?\s*write)?`)
 
 	// Domain keyword triggers.
 	eCommerceKeywords = []string{"ecommerce", "e-commerce", "shop", "checkout", "cart", "order", "inventory", "store"}
@@ -24,7 +25,8 @@ var (
 	telemetryKeywords = []string{"iot", "telemetry", "sensor", "metrics", "time-series", "timeseries", "device tracking"}
 	chatKeywords      = []string{"chat", "messaging", "websocket", "real-time", "realtime", "presence"}
 	analyticsKeywords = []string{"analytics", "reporting", "dashboard", "bi", "data warehouse", "olap", "etl"}
-	contentKeywords   = []string{"blog", "cms", "media", "video", "catalog", "article", "news", "stream"}
+	contentKeywords   = []string{"blog", "cms", "media", "video", "catalog", "article", "news", "stream", "url shortener"}
+	pipelineKeywords  = []string{"pipeline", "worker", "batch", "notification", "dispatcher", "background job"}
 )
 
 // Normalizer parses unstructured requirements and optional structured flags into NormalizedRequirements.
@@ -106,6 +108,8 @@ func detectDomain(raw model.RawRequirement, promptLower string) model.DomainCate
 			return model.DomainAnalytics
 		case "CHAT":
 			return model.DomainRealtimeChat
+		case "ASYNC_PIPELINE", "PIPELINE", "WORKER", "NOTIFICATION":
+			return model.DomainAsyncPipeline
 		}
 	}
 
@@ -117,6 +121,9 @@ func detectDomain(raw model.RawRequirement, promptLower string) model.DomainCate
 	}
 	if containsAny(promptLower, telemetryKeywords) {
 		return model.DomainIoTTelemetry
+	}
+	if containsAny(promptLower, pipelineKeywords) {
+		return model.DomainAsyncPipeline
 	}
 	if containsAny(promptLower, chatKeywords) {
 		return model.DomainRealtimeChat
@@ -187,8 +194,14 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 		profile.IsBursty = true
 	}
 
-	// Adjust read-write ratios based on domain hints.
-	if strings.Contains(promptLower, "read-heavy") || strings.Contains(promptLower, "catalog") || strings.Contains(promptLower, "feed") {
+	// Adjust read-write ratios based on explicit ratio or domain hints.
+	if match := ratioRegex.FindStringSubmatch(trafficText); len(match) > 2 {
+		rVal, err1 := strconv.ParseFloat(match[1], 64)
+		wVal, err2 := strconv.ParseFloat(match[2], 64)
+		if err1 == nil && err2 == nil && wVal > 0 {
+			profile.ReadWriteRatio = rVal / wVal
+		}
+	} else if strings.Contains(promptLower, "read-heavy") || strings.Contains(promptLower, "catalog") || strings.Contains(promptLower, "feed") || strings.Contains(promptLower, "shortener") {
 		profile.ReadWriteRatio = 10.0
 	} else if strings.Contains(promptLower, "write-heavy") || strings.Contains(promptLower, "telemetry") || strings.Contains(promptLower, "ingestion") {
 		profile.ReadWriteRatio = 0.2 // 5 writes per 1 read

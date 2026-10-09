@@ -1,0 +1,6 @@
+{
+  "prompt": "Build an asynchronous notification dispatcher worker service processing email, SMS, and push notification batch jobs with retry policies and dead-letter queues.",
+  "domain_hint": "ASYNC_PIPELINE",
+  "preferred_stack": ["Go", "PostgreSQL"],
+  "stated_traffic": "50 RPS"
+}

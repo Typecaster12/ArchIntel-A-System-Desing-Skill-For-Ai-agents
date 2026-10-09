@@ -1,0 +1,6 @@
+{
+  "prompt": "Build an e-commerce checkout service handling 300 RPS with flash sale inventory reservation, payment gateway webhook notifications, and PCI-DSS compliance.",
+  "domain_hint": "ECOMMERCE",
+  "preferred_stack": ["Go", "PostgreSQL"],
+  "stated_traffic": "300 RPS"
+}

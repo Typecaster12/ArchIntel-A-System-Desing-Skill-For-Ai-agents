@@ -1,0 +1,6 @@
+{
+  "prompt": "Build an internal company employee directory and task management admin panel with 200 daily users.",
+  "domain_hint": "CRUD",
+  "preferred_stack": ["Go", "SQLite"],
+  "stated_traffic": "200 DAU"
+}

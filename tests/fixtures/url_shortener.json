@@ -1,0 +1,6 @@
+{
+  "prompt": "Build a high-performance URL shortener service expecting 100k DAU with 20:1 read to write ratio and sub-50ms latency.",
+  "domain_hint": "CONTENT",
+  "preferred_stack": ["Go", "Redis", "PostgreSQL"],
+  "stated_traffic": "100k DAU"
+}
