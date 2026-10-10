@@ -65,6 +65,9 @@ type TrafficProfile struct {
 	// IsExplicit indicates if these traffic figures were directly specified by the user.
 	IsExplicit bool `json:"is_explicit"`
 
+	// IsPeakExplicit indicates if peak RPS was specifically supplied by the user.
+	IsPeakExplicit bool `json:"is_peak_explicit,omitempty"`
+
 	// StatedAttendees is the total registered attendee or user count mentioned in requirements.
 	StatedAttendees int64 `json:"stated_attendees,omitempty"`
 
@@ -160,6 +163,12 @@ type BusinessInvariants struct {
 
 	// RequiresOfflineHandling is true if client operations must buffer locally and sync later.
 	RequiresOfflineHandling bool `json:"requires_offline_handling"`
+
+	// OfflineHandlingState categorizes offline requirement certainty ("CONFIRMED_REQUIRED", "RECOMMENDED_PROVISIONAL", "NOT_SPECIFIED").
+	OfflineHandlingState string `json:"offline_handling_state,omitempty"`
+
+	// NetworkResilienceMode captures the network failure mitigation strategy ("RETRY_ON_TRANSIENT_FAILURE", "OFFLINE_BUFFER_RECOMMENDED", "OFFLINE_FIRST_MANDATORY", "NONE").
+	NetworkResilienceMode string `json:"network_resilience_mode,omitempty"`
 
 	// OfflineConflictPolicy represents the chosen or proposed conflict resolution policy.
 	OfflineConflictPolicy string `json:"offline_conflict_policy,omitempty"`

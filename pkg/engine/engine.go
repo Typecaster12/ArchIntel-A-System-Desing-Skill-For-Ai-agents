@@ -109,6 +109,18 @@ func (e *Engine) RecommendArchitecture(ctx context.Context, raw model.RawRequire
 	// Stage 2: Identify gaps and missing information
 	gaps := e.gapDetector.Analyze(norm)
 
+	// Preserve gap detector assumptions and ensure they reach normalized requirements without duplicates
+	seenAssumptions := make(map[string]bool)
+	for _, a := range norm.Assumptions {
+		seenAssumptions[a] = true
+	}
+	for _, a := range gaps.Assumptions {
+		if !seenAssumptions[a] {
+			seenAssumptions[a] = true
+			norm.Assumptions = append(norm.Assumptions, a)
+		}
+	}
+
 	// Stage 3: Classify workload
 	class, err := e.classifier.Classify(ctx, norm)
 	if err != nil {
@@ -122,6 +134,15 @@ func (e *Engine) RecommendArchitecture(ctx context.Context, raw model.RawRequire
 	archContract, err := e.generator.Generate(norm, class, summary)
 	if err != nil {
 		return nil, fmt.Errorf("contract generation failed: %w", err)
+	}
+
+	// Preserve unresolved questions and provisional decisions from gap detector in the final contract
+	if len(gaps.Questions) > 0 {
+		unresolved := make([]string, 0, len(gaps.Questions))
+		for _, q := range gaps.Questions {
+			unresolved = append(unresolved, fmt.Sprintf("[%s] %s (Applied default: %s)", q.Topic, q.Question, q.AppliedDefault))
+		}
+		archContract.UnresolvedDecisions = unresolved
 	}
 
 	// Retrieve pertinent anti-patterns to guard against

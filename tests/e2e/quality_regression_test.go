@@ -7,6 +7,7 @@ import (
 
 	"github.com/sdskill/archintel/pkg/engine"
 	"github.com/sdskill/archintel/pkg/model"
+	"github.com/sdskill/archintel/pkg/validator"
 )
 
 func newTestEngine() *engine.Engine {
@@ -163,6 +164,148 @@ The initial team is small, the project has a limited infrastructure budget, and 
 	}
 	if !foundBrokerReject {
 		t.Errorf("expected Dedicated Broker rejection")
+	}
+
+	// Regression checks: Bursty traffic trait is active from arrival window
+	if !resp.Normalized.Traffic.IsBursty {
+		t.Errorf("expected Normalized.Traffic.IsBursty to be true for concentrated arrival window")
+	}
+	if !resp.Classification.HasTrait(model.TraitBurstyTraffic) {
+		t.Errorf("expected TraitBurstyTraffic to be active in classification result")
+	}
+
+	// Regression checks: Background Intensive trait is active from async certificate and email processing
+	if !resp.Classification.HasTrait(model.TraitBackgroundIntensive) {
+		t.Errorf("expected TraitBackgroundIntensive to be active in classification result")
+	}
+
+	// Regression checks: Consistency Sensitive trait is active from duplicate attendance prevention
+	if !resp.Classification.HasTrait(model.TraitConsistencySensitive) {
+		t.Errorf("expected TraitConsistencySensitive to be active in classification result")
+	}
+
+	// Regression checks: Idempotency policy coherence
+	if !contract.Data.IdempotencyPolicy.Required {
+		t.Errorf("expected contract.Data.IdempotencyPolicy.Required to be true")
+	}
+	if contract.Data.RequiresIdempotencyKey != contract.Data.IdempotencyPolicy.Required {
+		t.Errorf("expected RequiresIdempotencyKey and IdempotencyPolicy.Required to agree")
+	}
+
+	// Regression checks: Worker concurrency agreement across queue and capacity plan
+	if contract.Queue.MaxWorkerConcurrency != contract.CapacityPlan.WorkerConcurrencyMax {
+		t.Errorf("worker concurrency mismatch: queue=%d, capacity_plan=%d",
+			contract.Queue.MaxWorkerConcurrency, contract.CapacityPlan.WorkerConcurrencyMax)
+	}
+
+	// Regression checks: durable lease claim mechanism is defined
+	if contract.Queue.JobClaimMechanism == "" {
+		t.Errorf("expected non-empty Queue.JobClaimMechanism")
+	}
+	if contract.Queue.ClaimLeaseDuration == "" {
+		t.Errorf("expected non-empty Queue.ClaimLeaseDuration")
+	}
+
+	// Regression checks: Offline Handling state is RECOMMENDED_PROVISIONAL
+	if contract.OfflineSync.HandlingState != "RECOMMENDED_PROVISIONAL" {
+		t.Errorf("expected OfflineSync.HandlingState RECOMMENDED_PROVISIONAL, got %s", contract.OfflineSync.HandlingState)
+	}
+
+	// Regression checks: constraint severity is WARNING for provisional recommendation
+	foundOfflineWarning := false
+	for _, c := range contract.Constraints {
+		if c.Category == "DATA_INTEGRITY" && c.Severity == "WARNING" {
+			foundOfflineWarning = true
+			break
+		}
+	}
+	if !foundOfflineWarning {
+		t.Errorf("expected provisional offline sync constraint to have severity WARNING")
+	}
+
+	// Regression checks: Fencing token & lease renewal mechanisms defined
+	if contract.Queue.FencingTokenMechanism == "" {
+		t.Errorf("expected non-empty FencingTokenMechanism in QueueRules")
+	}
+	if contract.Queue.LeaseRenewalPolicy == "" {
+		t.Errorf("expected non-empty LeaseRenewalPolicy in QueueRules")
+	}
+
+	// Regression checks: Provider-specific idempotency integrations populated
+	if len(contract.Queue.ProviderIntegrations) < 2 {
+		t.Fatalf("expected at least 2 provider integrations for conference (email, cert storage), got %d", len(contract.Queue.ProviderIntegrations))
+	}
+	foundEmailIntegration := false
+	foundStorageIntegration := false
+	for _, p := range contract.Queue.ProviderIntegrations {
+		if strings.Contains(strings.ToLower(p.ProviderName), "email") {
+			foundEmailIntegration = true
+			if p.AmbiguousTimeoutPlan == "" {
+				t.Errorf("email integration missing AmbiguousTimeoutPlan")
+			}
+		}
+		if strings.Contains(strings.ToLower(p.ProviderName), "storage") || strings.Contains(strings.ToLower(p.ProviderName), "cert") {
+			foundStorageIntegration = true
+			if p.AmbiguousTimeoutPlan == "" {
+				t.Errorf("certificate storage integration missing AmbiguousTimeoutPlan")
+			}
+		}
+	}
+	if !foundEmailIntegration {
+		t.Errorf("expected email provider idempotency specification")
+	}
+	if !foundStorageIntegration {
+		t.Errorf("expected certificate storage idempotency specification")
+	}
+
+	// Regression checks: Exact registration and attendance uniqueness differentiation
+	if !strings.Contains(contract.Data.UniquenessStrategy, "UNIQUE(email)") {
+		t.Errorf("expected UniquenessStrategy to specify UNIQUE(email) for registrations, got: %s", contract.Data.UniquenessStrategy)
+	}
+	if !strings.Contains(contract.Data.UniquenessStrategy, "UNIQUE(delegate_id, session_id)") {
+		t.Errorf("expected UniquenessStrategy to specify UNIQUE(delegate_id, session_id) for attendance, got: %s", contract.Data.UniquenessStrategy)
+	}
+
+	// Regression checks: Explicit idempotency conflict handling (no 'A or B' ambiguity)
+	if strings.Contains(contract.Data.IdempotencyPolicy.ConcurrentRequestHandling, " or ") {
+		t.Errorf("ConcurrentRequestHandling must not contain ambiguous 'or' clauses: %s", contract.Data.IdempotencyPolicy.ConcurrentRequestHandling)
+	}
+	if !strings.Contains(contract.Data.IdempotencyPolicy.ConcurrentRequestHandling, "409") {
+		t.Errorf("expected HTTP 409 in ConcurrentRequestHandling: %s", contract.Data.IdempotencyPolicy.ConcurrentRequestHandling)
+	}
+	if strings.Contains(contract.Data.IdempotencyPolicy.RetentionPeriod, "to") {
+		t.Errorf("RetentionPeriod must be explicit rather than a range: %s", contract.Data.IdempotencyPolicy.RetentionPeriod)
+	}
+
+	// Regression checks: Physical arrival vs HTTP RPS semantics
+	if resp.Normalized.Traffic.TrafficSource != "DERIVED_FROM_ARRIVALS" {
+		t.Errorf("expected TrafficSource DERIVED_FROM_ARRIVALS, got %s", resp.Normalized.Traffic.TrafficSource)
+	}
+	if resp.Normalized.Traffic.ArrivalsPerSec < 0.20 || resp.Normalized.Traffic.ArrivalsPerSec > 0.30 {
+		t.Errorf("expected physical arrival rate ~0.22 arr/sec, got %0.2f", resp.Normalized.Traffic.ArrivalsPerSec)
+	}
+	if resp.Normalized.Traffic.EstimatedHTTPRPS != 15.0 {
+		t.Errorf("expected estimated HTTP RPS 15.0, got %0.1f", resp.Normalized.Traffic.EstimatedHTTPRPS)
+	}
+}
+
+// 1b. Assumed default traffic must not trigger TraitBurstyTraffic
+func TestAssumedDefaultTrafficDoesNotTriggerBurstyTrait(t *testing.T) {
+	eng := newTestEngine()
+	ctx := context.Background()
+
+	prompt := `Build a simple conference schedule viewer for attendees to browse speaker bios and talk abstracts.`
+	resp, err := eng.RecommendArchitecture(ctx, model.RawRequirement{Prompt: prompt})
+	if err != nil {
+		t.Fatalf("RecommendArchitecture failed: %v", err)
+	}
+
+	if resp.Normalized.Traffic.TrafficSource != "ASSUMED_DEFAULT" {
+		t.Errorf("expected ASSUMED_DEFAULT, got %s", resp.Normalized.Traffic.TrafficSource)
+	}
+
+	if resp.Classification.HasTrait(model.TraitBurstyTraffic) {
+		t.Errorf("TraitBurstyTraffic must not be activated based solely on default 10:30 RPS ratio")
 	}
 }
 
@@ -336,4 +479,106 @@ func TestOfflineSyncApplication(t *testing.T) {
 	if err := contract.ValidateConsistency(); err != nil {
 		t.Errorf("contract consistency validation failed: %v", err)
 	}
+}
+
+// 9. Comprehensive Pipeline Invariant & Regression Hardening
+func TestStage5QualityAndRegressionHardening(t *testing.T) {
+	eng := newTestEngine()
+	ctx := context.Background()
+
+	t.Run("explicit peak RPS survives pipeline without heuristic overwrite", func(t *testing.T) {
+		prompt := "Micro-auction bidding engine with baseline of 60 RPS and explicit peak of 95 RPS under burst bidding. Must prevent double bids."
+		resp, err := eng.RecommendArchitecture(ctx, model.RawRequirement{Prompt: prompt})
+		if err != nil {
+			t.Fatalf("RecommendArchitecture failed: %v", err)
+		}
+
+		if resp.Normalized.Traffic.ExpectedRPS != 60.0 {
+			t.Errorf("expected baseline 60.0, got %v", resp.Normalized.Traffic.ExpectedRPS)
+		}
+		if resp.Normalized.Traffic.PeakRPS != 95.0 {
+			t.Errorf("expected explicit peak 95.0, got %v", resp.Normalized.Traffic.PeakRPS)
+		}
+		if !resp.Normalized.Traffic.IsPeakExplicit {
+			t.Errorf("expected IsPeakExplicit to be true")
+		}
+		if resp.Contract.CapacityPlan.PlanningArrivalRate != 95.0 {
+			t.Errorf("expected CapacityPlan planning rate 95.0, got %v", resp.Contract.CapacityPlan.PlanningArrivalRate)
+		}
+	})
+
+	t.Run("gap detector assumptions and unresolved decisions reach final contract", func(t *testing.T) {
+		prompt := "Inventory service for regional warehouses."
+		resp, err := eng.RecommendArchitecture(ctx, model.RawRequirement{Prompt: prompt})
+		if err != nil {
+			t.Fatalf("RecommendArchitecture failed: %v", err)
+		}
+
+		if len(resp.Contract.ActiveAssumptions) == 0 {
+			t.Errorf("expected active assumptions in contract for unspecified input")
+		}
+		if len(resp.Gaps.Questions) > 0 && len(resp.Contract.UnresolvedDecisions) == 0 {
+			t.Errorf("expected unresolved decisions from gaps to reach contract")
+		}
+	})
+
+	t.Run("ecommerce domain does not leak conference terms in decision traces", func(t *testing.T) {
+		prompt := "E-commerce checkout service with payment capture, order placement, and inventory decrement. Prevent duplicate orders and retry asynchronously."
+		resp, err := eng.RecommendArchitecture(ctx, model.RawRequirement{Prompt: prompt})
+		if err != nil {
+			t.Fatalf("RecommendArchitecture failed: %v", err)
+		}
+
+		for _, trace := range resp.Contract.DecisionTraces {
+			fullTrace := trace.Decision + " " + trace.EvidenceAndProvenance + " " + strings.Join(trace.SupportingRequirements, " ") + " " + strings.Join(trace.RejectedReasons, " ")
+			lower := strings.ToLower(fullTrace)
+			for _, forbidden := range []string{"volunteer", "certificate", "delegate", "attendance"} {
+				if strings.Contains(lower, forbidden) {
+					t.Errorf("decision trace leaked forbidden term %q: %s", forbidden, fullTrace)
+				}
+			}
+		}
+	})
+
+	t.Run("validator rejects nonstandard paths and catches bypass attempts", func(t *testing.T) {
+		contract := &model.ArchitectureContract{
+			ContractVersion: "1.0.0",
+			ProjectName:     "TestApp",
+			Data: model.DataRules{
+				RequiresIdempotencyKey: true,
+				RequiresOutboxPattern:  true,
+				UniquenessStrategy:     "UNIQUE(user_id, account_id)",
+			},
+			Queue: model.QueueRules{
+				Enabled:        true,
+				QueueMechanism: "POSTGRES_SKIP_LOCKED",
+			},
+		}
+
+		val := eng.ValidateArchitecture(contract, validator.ImplementationProposal{
+			Files: []validator.CodeFileProposal{
+				{
+					Path: "routes/orders.go", // nonstandard path outside handler/controller
+					Content: `package routes
+func SubmitOrder(w http.ResponseWriter, r *http.Request) {
+	// workerpool comment attempt to fool scanner
+	go func() {
+		saveOrder()
+	}()
+}`,
+				},
+			},
+		})
+
+		foundAST := false
+		for _, v := range val.Violations {
+			if v.RuleID == "VIOL-AST-UNBOUNDED-GOROUTINE" {
+				foundAST = true
+				break
+			}
+		}
+		if !foundAST {
+			t.Errorf("expected VIOL-AST-UNBOUNDED-GOROUTINE to catch unbounded goroutine in routes/orders.go")
+		}
+	})
 }

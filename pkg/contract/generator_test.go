@@ -40,6 +40,12 @@ func TestContractGenerationSuccess(t *testing.T) {
 			RequiresIdempotencyKey: true,
 			RequiresOutboxPattern:  true,
 			ConnectionPoolMax:      35,
+			IdempotencyPolicy: model.IdempotencyPolicy{
+				Required:              true,
+				KeyScope:              "HEADER_IDEMPOTENCY_KEY_PER_OPERATION",
+				FingerprintMechanism:  "SHA-256 hash of request body",
+				StateStorageMechanism: "PostgreSQL idempotency_keys table",
+			},
 		},
 		RecommendedQueueRules: model.QueueRules{
 			Enabled:              true,

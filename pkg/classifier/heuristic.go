@@ -144,6 +144,9 @@ func evaluateTransactionHeavy(req *model.NormalizedRequirements) (float64, strin
 	if req.Domain == model.DomainECommerce && req.Data.RequiresACID {
 		return 0.90, "E-Commerce checkout with ACID inventory and payment coordination"
 	}
+	if req.Data.RequiresACID && req.Data.AtomicOutboxRequired {
+		return 0.85, "Explicit requirement for multi-step ACID mutations and atomic transactional outbox dispatch"
+	}
 	if req.Data.RequiresACID {
 		return 0.80, "Explicit requirement for multi-row ACID database transactions"
 	}
@@ -216,13 +219,18 @@ func evaluateConsistencySensitive(req *model.NormalizedRequirements) (float64, s
 }
 
 func evaluateBurstyTraffic(req *model.NormalizedRequirements) (float64, string) {
-	if req.Traffic.IsBursty {
-		return 0.90, "Traffic spikes explicitly expected (e.g. arrivals within window or flash sales)"
+	if req.Traffic.IsBursty || req.Traffic.PeakArrivalWindow != "" {
+		windowInfo := ""
+		if req.Traffic.PeakArrivalWindow != "" {
+			windowInfo = fmt.Sprintf(" (%s)", req.Traffic.PeakArrivalWindow)
+		}
+		return 0.90, fmt.Sprintf("Traffic spikes and concentrated arrival windows explicitly documented%s", windowInfo)
 	}
-	if req.Traffic.PeakRPS >= req.Traffic.ExpectedRPS*3.0 && req.Traffic.PeakRPS > 100 {
-		return 0.75, "Peak throughput is 3x or greater than baseline RPS"
+	// Do not declare burstiness based on assumed defaults (e.g. 10 vs 30 RPS default ratio)
+	if req.Traffic.TrafficSource != "ASSUMED_DEFAULT" && req.Traffic.PeakRPS >= req.Traffic.ExpectedRPS*3.0 && req.Traffic.PeakRPS > 50 {
+		return 0.75, fmt.Sprintf("Peak throughput (%0.1f RPS) exceeds baseline (%0.1f RPS) significantly based on user-stated figures", req.Traffic.PeakRPS, req.Traffic.ExpectedRPS)
 	}
-	return 0.20, "Traffic pattern is steady and predictable"
+	return 0.20, "Traffic pattern is steady or unmeasured; burstiness not indicated"
 }
 
 func evaluateHighContention(req *model.NormalizedRequirements) (float64, string) {

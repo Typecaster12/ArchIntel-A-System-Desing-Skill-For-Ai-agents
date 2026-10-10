@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"regexp"
 	"strings"
 
 	"github.com/sdskill/archintel/pkg/model"
@@ -30,6 +31,7 @@ func (v *Validator) Validate(contract *model.ArchitectureContract, proposal Impl
 	report := &ValidationReport{
 		IsCompliant: true,
 		Violations:  make([]Violation, 0),
+		Limitations: make([]string, 0),
 	}
 
 	// 1. Check explicit proposal flags against contract requirements
@@ -95,41 +97,36 @@ func (v *Validator) checkDeclaredFlags(contract *model.ArchitectureContract, pro
 	}
 }
 
-// inspectFile analyzes code files for dangerous architectural anti-patterns.
+var (
+	commentSingleRe = regexp.MustCompile(`//[^\n]*`)
+	commentMultiRe  = regexp.MustCompile(`/\*[\s\S]*?\*/`)
+	insertQueryRe   = regexp.MustCompile(`(?i)insert\s+into\s+([a-zA-Z0-9_]+)`)
+)
+
+// stripComments removes Go line and block comments while preserving line count.
+func stripComments(content string) string {
+	cleaned := commentMultiRe.ReplaceAllStringFunc(content, func(m string) string {
+		return strings.Repeat("\n", strings.Count(m, "\n"))
+	})
+	return commentSingleRe.ReplaceAllString(cleaned, "")
+}
+
+// inspectFile analyzes code files for architectural anti-patterns with AST and hardened lexical checks.
 func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeFileProposal, report *ValidationReport) {
-	lowerContent := strings.ToLower(file.Content)
+	cleanContent := stripComments(file.Content)
+	lowerClean := strings.ToLower(cleanContent)
 	lowerPath := strings.ToLower(file.Path)
 
-	// Perform Go AST inspection if the file has valid Go syntax
-	v.inspectGoAST(file, report)
+	astSuccess := v.inspectFileWithAST(contract, file, cleanContent, report)
 
-	// Check 1: Synchronous external HTTP inside active DB transaction
-	if (strings.Contains(lowerContent, "tx.begin") || strings.Contains(lowerContent, "begintx") || strings.Contains(lowerContent, "db.begin") || strings.Contains(lowerContent, ".begin()")) &&
-		(strings.Contains(lowerContent, "http.get") || strings.Contains(lowerContent, "http.post") || strings.Contains(lowerContent, "client.do")) {
-		report.Violations = append(report.Violations, Violation{
-			RuleID:      "VIOL-SYNC-HTTP-IN-TX",
-			Severity:    SeverityError,
-			File:        file.Path,
-			Message:     "Detected outbound HTTP call within active database transaction block.",
-			Remediation: "Move external HTTP calls outside the transaction. Commit state changes to the local DB (with Outbox row) before making network calls.",
-		})
-	}
-
-	// Check 2: Direct SQL queries in HTTP handler files
-	if (strings.Contains(lowerPath, "handler") || strings.Contains(lowerPath, "controller")) &&
-		(strings.Contains(lowerContent, "select ") || strings.Contains(lowerContent, "update ") || strings.Contains(lowerContent, "db.query") || strings.Contains(lowerContent, "db.exec")) {
-		report.Violations = append(report.Violations, Violation{
-			RuleID:      "VIOL-DB-IN-HANDLER",
-			Severity:    SeverityWarning,
-			File:        file.Path,
-			Message:     "Direct database query executed inside HTTP handler layer.",
-			Remediation: "Decouple persistence logic into a dedicated repository or store package. Handlers should only orchestrate domain services.",
-		})
+	// If AST parsing could not analyze Go syntax (e.g. raw code snippets), fall back to hardened lexical checks
+	if !astSuccess {
+		v.inspectLexicalFallback(contract, file, lowerClean, report)
 	}
 
 	// Check 3: Queue polling without SKIP LOCKED
 	if contract.Queue.QueueMechanism == "POSTGRES_SKIP_LOCKED" {
-		if strings.Contains(lowerContent, "for update") && !strings.Contains(lowerContent, "skip locked") {
+		if strings.Contains(lowerClean, "for update") && !strings.Contains(lowerClean, "skip locked") {
 			report.Violations = append(report.Violations, Violation{
 				RuleID:      "VIOL-QUEUE-MISSING-SKIP-LOCKED",
 				Severity:    SeverityError,
@@ -140,55 +137,57 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 		}
 	}
 
-	// Check 4: Unbounded goroutines in handlers (regex fallback)
-	if strings.Contains(lowerPath, "handler") && (strings.Contains(lowerContent, "go func(") || strings.Contains(lowerContent, "go handle")) {
-		if !strings.Contains(lowerContent, "semaphore") && !strings.Contains(lowerContent, "workerpool") && !strings.Contains(lowerContent, "pool.") {
-			report.Violations = append(report.Violations, Violation{
-				RuleID:      "VIOL-UNBOUNDED-HANDLER-GOROUTINE",
-				Severity:    SeverityWarning,
-				File:        file.Path,
-				Message:     "Unbounded goroutine spawned inside request handler without visible concurrency bounds.",
-				Remediation: "Enqueue background work to a bounded worker queue instead of spawning raw goroutines per HTTP request.",
-			})
-		}
-	}
-
-	// Check 5: Non-atomic duplicate check / missing conflict handling
+	// Check 5: Generalized non-atomic duplicate check
 	if contract.Data.UniquenessStrategy != "" {
-		if (strings.Contains(lowerContent, "insert into attendance") || strings.Contains(lowerContent, "insert into registration")) &&
-			!strings.Contains(lowerContent, "on conflict") && !strings.Contains(lowerContent, "for update") {
-			report.Violations = append(report.Violations, Violation{
-				RuleID:      "VIOL-NON-ATOMIC-DUPLICATE-CHECK",
-				Severity:    SeverityError,
-				File:        file.Path,
-				Message:     "Attendance or registration INSERT query lacks atomic 'ON CONFLICT' duplicate handling.",
-				Remediation: "Use database-level unique constraint with atomic conflict handling: 'INSERT INTO attendance (...) VALUES (...) ON CONFLICT (delegate_id, session_id) DO NOTHING'.",
-			})
+		if matches := insertQueryRe.FindAllStringSubmatch(cleanContent, -1); len(matches) > 0 {
+			if !strings.Contains(lowerClean, "on conflict") && !strings.Contains(lowerClean, "for update") {
+				for _, match := range matches {
+					tbl := match[1]
+					msg := "Attendance or registration INSERT query lacks atomic 'ON CONFLICT' duplicate handling."
+					if tbl != "attendance" && tbl != "registration" {
+						msg = fmt.Sprintf("Database INSERT query on table %q lacks atomic 'ON CONFLICT' duplicate handling.", tbl)
+					}
+					report.Violations = append(report.Violations, Violation{
+						RuleID:      "VIOL-NON-ATOMIC-DUPLICATE-CHECK",
+						Severity:    SeverityError,
+						File:        file.Path,
+						Message:     msg,
+						Remediation: fmt.Sprintf("Use database-level unique constraint with atomic conflict handling: 'INSERT INTO %s (...) VALUES (...) ON CONFLICT (...) DO NOTHING'.", tbl),
+					})
+					break // Report once per file
+				}
+			}
 		}
 	}
 
-	// Check 6: Missing or Shallow Idempotency Key validation in mutating handler
-	if contract.Data.RequiresIdempotencyKey && (strings.Contains(lowerPath, "handler") || strings.Contains(lowerPath, "controller")) {
-		isMutating := strings.Contains(lowerContent, "checkin") ||
-			strings.Contains(lowerContent, "checkout") ||
-			strings.Contains(lowerContent, "register") ||
-			strings.Contains(lowerContent, "payment") ||
-			strings.Contains(lowerContent, "order")
+	// Check 6: Missing or Shallow Idempotency Key validation on mutating HTTP routes
+	isMutatingPathOrContent := isRequestHandlerPath(file.Path) ||
+		strings.Contains(lowerClean, "checkin") || strings.Contains(lowerClean, "checkout") ||
+		strings.Contains(lowerClean, "register") || strings.Contains(lowerClean, "payment") || strings.Contains(lowerClean, "order")
+
+	if contract.Data.RequiresIdempotencyKey && isMutatingPathOrContent {
+		isMutating := strings.Contains(lowerClean, "checkin") ||
+			strings.Contains(lowerClean, "checkout") ||
+			strings.Contains(lowerClean, "register") ||
+			strings.Contains(lowerClean, "payment") ||
+			strings.Contains(lowerClean, "order") ||
+			strings.Contains(lowerPath, "checkout") ||
+			strings.Contains(lowerPath, "payment") ||
+			strings.Contains(lowerPath, "checkin")
 
 		if isMutating {
-			hasHeader := strings.Contains(lowerContent, "header.get(\"idempotency") ||
-				strings.Contains(lowerContent, "header.get(\"x-idempotency") ||
-				strings.Contains(lowerContent, "\"idempotency-key\"") ||
-				strings.Contains(lowerContent, "\"x-idempotency-key\"") ||
-				strings.Contains(lowerContent, "idempotency-key")
+			hasHeader := strings.Contains(lowerClean, "idempotency-key") ||
+				strings.Contains(lowerClean, "x-idempotency-key") ||
+				strings.Contains(lowerClean, "header.get(\"idempotency") ||
+				strings.Contains(lowerClean, "header.get(\"x-idempotency")
 
-			hasStoreOrFingerprint := strings.Contains(lowerContent, "store") ||
-				strings.Contains(lowerContent, "fingerprint") ||
-				strings.Contains(lowerContent, "sha256") ||
-				strings.Contains(lowerContent, "replay") ||
-				strings.Contains(lowerContent, "repo") ||
-				strings.Contains(lowerContent, "cached") ||
-				strings.Contains(lowerContent, "idempotency_keys")
+			hasStoreOrFingerprint := strings.Contains(lowerClean, "store") ||
+				strings.Contains(lowerClean, "fingerprint") ||
+				strings.Contains(lowerClean, "sha256") ||
+				strings.Contains(lowerClean, "replay") ||
+				strings.Contains(lowerClean, "repo") ||
+				strings.Contains(lowerClean, "cached") ||
+				strings.Contains(lowerClean, "idempotency_keys")
 
 			if !hasHeader {
 				report.Violations = append(report.Violations, Violation{
@@ -211,29 +210,294 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 	}
 }
 
-// inspectGoAST parses valid Go source files into AST and detects concurrency anti-patterns.
-func (v *Validator) inspectGoAST(file CodeFileProposal, report *ValidationReport) {
-	if !strings.HasSuffix(file.Path, ".go") {
-		return
-	}
+// inspectFileWithAST analyzes structured Go AST nodes.
+func (v *Validator) inspectFileWithAST(contract *model.ArchitectureContract, file CodeFileProposal, cleanContent string, report *ValidationReport) bool {
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, file.Path, file.Content, 0)
+	node, err := parser.ParseFile(fset, file.Path, cleanContent, 0)
 	if err != nil {
-		return // Not parseable as standalone Go AST; regex inspections will cover it
+		// Try wrapping snippet into valid Go package and function
+		wrapped := "package main\nfunc _snippetWrapper() {\n" + cleanContent + "\n}"
+		node, err = parser.ParseFile(fset, file.Path, wrapped, 0)
+		if err != nil {
+			return false
+		}
 	}
 
+	// 1. Map in-file helper functions that execute outbound HTTP calls
+	helperHasHTTP := make(map[string]bool)
 	ast.Inspect(node, func(n ast.Node) bool {
-		if _, ok := n.(*ast.GoStmt); ok {
-			if strings.Contains(strings.ToLower(file.Path), "handler") {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			return true
+		}
+		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			if isHTTPCall(inner) {
+				helperHasHTTP[fn.Name.Name] = true
+				return false
+			}
+			return true
+		})
+		return true
+	})
+
+	// 2. Inspect function declarations and function literals
+	isHandlerPath := isRequestHandlerPath(file.Path)
+
+	ast.Inspect(node, func(n ast.Node) bool {
+		var body *ast.BlockStmt
+		var isHandler bool
+		var funcName string
+
+		switch fn := n.(type) {
+		case *ast.FuncDecl:
+			body = fn.Body
+			funcName = fn.Name.Name
+			isHandler = isHandlerPath || isHTTPHandlerSignature(fn.Type)
+		case *ast.FuncLit:
+			body = fn.Body
+			funcName = "anonymous_function"
+			isHandler = isHandlerPath || isHTTPHandlerSignature(fn.Type)
+		}
+
+		if body == nil {
+			return true
+		}
+
+		// A. Scope-based Check 1: Synchronous HTTP inside DB transaction
+		hasTx := false
+		hasDirectHTTP := false
+		calledHTTPHelper := ""
+		hasUnresolvedCall := false
+
+		ast.Inspect(body, func(bn ast.Node) bool {
+			if isTxBeginCall(bn) {
+				hasTx = true
+			}
+			if isHTTPCall(bn) {
+				hasDirectHTTP = true
+			}
+			if call, ok := bn.(*ast.CallExpr); ok {
+				if id, ok := call.Fun.(*ast.Ident); ok {
+					if helperHasHTTP[id.Name] {
+						calledHTTPHelper = id.Name
+					}
+				} else if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+					pkgName := fmt.Sprintf("%s.%s", exprToString(sel.X), sel.Sel.Name)
+					if !strings.HasPrefix(pkgName, "http.") && !strings.HasPrefix(pkgName, "tx.") && !strings.HasPrefix(pkgName, "db.") {
+						hasUnresolvedCall = true
+					}
+				}
+			}
+			return true
+		})
+
+		if hasTx && (hasDirectHTTP || calledHTTPHelper != "") {
+			detail := "Detected outbound HTTP call within active database transaction block."
+			if calledHTTPHelper != "" {
+				detail = fmt.Sprintf("Detected outbound HTTP call within active database transaction block via helper function %q.", calledHTTPHelper)
+			}
+			report.Violations = append(report.Violations, Violation{
+				RuleID:      "VIOL-SYNC-HTTP-IN-TX",
+				Severity:    SeverityError,
+				File:        file.Path,
+				Message:     detail,
+				Remediation: "Move external HTTP calls outside the transaction. Commit state changes to the local DB (with Outbox row) before making network calls.",
+			})
+		} else if hasTx && hasUnresolvedCall {
+			report.Limitations = append(report.Limitations, fmt.Sprintf(
+				"%s: Function %q begins a DB transaction and calls external helper; interprocedural analysis cannot prove external network call safety statically",
+				file.Path, funcName,
+			))
+		}
+
+		// B. Check 2: Direct SQL in HTTP handler
+		if isHandler {
+			hasDirectSQL := false
+			ast.Inspect(body, func(bn ast.Node) bool {
+				if isDirectDBCall(bn) {
+					hasDirectSQL = true
+					return false
+				}
+				return true
+			})
+			if hasDirectSQL {
 				report.Violations = append(report.Violations, Violation{
-					RuleID:      "VIOL-AST-UNBOUNDED-GOROUTINE",
+					RuleID:      "VIOL-DB-IN-HANDLER",
 					Severity:    SeverityWarning,
 					File:        file.Path,
-					Message:     "Go AST analysis detected direct 'go' goroutine dispatch in HTTP handler layer.",
-					Remediation: "Pass background tasks to a bounded worker pool or channel queue to prevent memory exhaustion.",
+					Message:     "Direct database query executed inside HTTP handler layer.",
+					Remediation: "Decouple persistence logic into a dedicated repository or store package. Handlers should only orchestrate domain services.",
 				})
+			}
+		}
+
+		// C. Check 4: Unbounded goroutine in HTTP handler
+		if isHandler {
+			ast.Inspect(body, func(bn ast.Node) bool {
+				goStmt, ok := bn.(*ast.GoStmt)
+				if !ok {
+					return true
+				}
+				if !isBoundedGoroutine(body, goStmt) {
+					report.Violations = append(report.Violations, Violation{
+						RuleID:      "VIOL-AST-UNBOUNDED-GOROUTINE",
+						Severity:    SeverityWarning,
+						File:        file.Path,
+						Message:     "Go AST analysis detected direct 'go' goroutine dispatch in HTTP handler layer.",
+						Remediation: "Pass background tasks to a bounded worker pool or channel queue to prevent memory exhaustion.",
+					})
+				}
+				return true
+			})
+		}
+
+		return true
+	})
+
+	return true
+}
+
+// inspectLexicalFallback runs when Go AST parsing cannot succeed.
+func (v *Validator) inspectLexicalFallback(contract *model.ArchitectureContract, file CodeFileProposal, lowerClean string, report *ValidationReport) {
+	// Check 1: Synchronous external HTTP inside active DB transaction
+	if (strings.Contains(lowerClean, "tx.begin") || strings.Contains(lowerClean, "begintx") || strings.Contains(lowerClean, "db.begin") || strings.Contains(lowerClean, ".begin()")) &&
+		(strings.Contains(lowerClean, "http.get") || strings.Contains(lowerClean, "http.post") || strings.Contains(lowerClean, "client.do")) {
+		report.Violations = append(report.Violations, Violation{
+			RuleID:      "VIOL-SYNC-HTTP-IN-TX",
+			Severity:    SeverityError,
+			File:        file.Path,
+			Message:     "Detected outbound HTTP call within active database transaction block.",
+			Remediation: "Move external HTTP calls outside the transaction. Commit state changes to the local DB (with Outbox row) before making network calls.",
+		})
+	}
+
+	// Check 2: Direct SQL queries in handler layer
+	if isRequestHandlerPath(file.Path) &&
+		(strings.Contains(lowerClean, "select ") || strings.Contains(lowerClean, "update ") || strings.Contains(lowerClean, "db.query") || strings.Contains(lowerClean, "db.exec")) {
+		report.Violations = append(report.Violations, Violation{
+			RuleID:      "VIOL-DB-IN-HANDLER",
+			Severity:    SeverityWarning,
+			File:        file.Path,
+			Message:     "Direct database query executed inside HTTP handler layer.",
+			Remediation: "Decouple persistence logic into a dedicated repository or store package. Handlers should only orchestrate domain services.",
+		})
+	}
+
+	// Check 4: Unbounded goroutine fallback
+	if isRequestHandlerPath(file.Path) && (strings.Contains(lowerClean, "go func(") || strings.Contains(lowerClean, "go handle")) {
+		if !strings.Contains(lowerClean, "semaphore") && !strings.Contains(lowerClean, "<-sem") && !strings.Contains(lowerClean, "pool.submit") {
+			report.Violations = append(report.Violations, Violation{
+				RuleID:      "VIOL-AST-UNBOUNDED-GOROUTINE",
+				Severity:    SeverityWarning,
+				File:        file.Path,
+				Message:     "Unbounded goroutine spawned inside request handler without visible concurrency bounds.",
+				Remediation: "Enqueue background work to a bounded worker queue instead of spawning raw goroutines per HTTP request.",
+			})
+		}
+	}
+}
+
+func isTxBeginCall(n ast.Node) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	method := strings.ToLower(sel.Sel.Name)
+	return method == "begin" || method == "begintx"
+}
+
+func isHTTPCall(n ast.Node) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg := strings.ToLower(exprToString(sel.X))
+	method := strings.ToLower(sel.Sel.Name)
+	if pkg == "http" && (method == "get" || method == "post" || method == "head" || method == "postform") {
+		return true
+	}
+	if (pkg == "client" || strings.Contains(pkg, "http")) && method == "do" {
+		return true
+	}
+	return false
+}
+
+func isDirectDBCall(n ast.Node) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	target := strings.ToLower(exprToString(sel.X))
+	method := strings.ToLower(sel.Sel.Name)
+	if (target == "db" || target == "database") && (method == "query" || method == "queryrow" || method == "exec" || method == "querycontext" || method == "execcontext") {
+		return true
+	}
+	return false
+}
+
+func isRequestHandlerPath(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.Contains(lower, "handler") || strings.Contains(lower, "controller") ||
+		strings.Contains(lower, "api") || strings.Contains(lower, "routes") ||
+		strings.Contains(lower, "endpoint") || strings.Contains(lower, "web")
+}
+
+func isHTTPHandlerSignature(ft *ast.FuncType) bool {
+	if ft == nil || ft.Params == nil {
+		return false
+	}
+	for _, field := range ft.Params.List {
+		typeStr := strings.ToLower(exprToString(field.Type))
+		if strings.Contains(typeStr, "responsewriter") || strings.Contains(typeStr, "request") ||
+			strings.Contains(typeStr, "gin.context") || strings.Contains(typeStr, "echo.context") {
+			return true
+		}
+	}
+	return false
+}
+
+func isBoundedGoroutine(block *ast.BlockStmt, goStmt *ast.GoStmt) bool {
+	hasBounds := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.SendStmt:
+			hasBounds = true
+		case *ast.UnaryExpr:
+			if node.Op == token.ARROW {
+				hasBounds = true
+			}
+		case *ast.CallExpr:
+			fnName := strings.ToLower(exprToString(node.Fun))
+			if strings.Contains(fnName, "pool.") || strings.Contains(fnName, "submit") || strings.Contains(fnName, "acquire") {
+				hasBounds = true
 			}
 		}
 		return true
 	})
+	return hasBounds
+}
+
+func exprToString(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return exprToString(e.X) + "." + e.Sel.Name
+	case *ast.StarExpr:
+		return "*" + exprToString(e.X)
+	default:
+		return ""
+	}
 }

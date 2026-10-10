@@ -1,6 +1,7 @@
 package evaluator
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/sdskill/archintel/pkg/knowledge"
@@ -86,5 +87,88 @@ func TestEvaluatorTelemetryPipelineDecision(t *testing.T) {
 
 	if summary.RecommendedTopology != model.TopologyPipeline {
 		t.Errorf("expected TopologyPipeline for IoT write-heavy stream, got %v", summary.RecommendedTopology)
+	}
+}
+
+func TestEvaluatorDecisionTracesDomainTailoring(t *testing.T) {
+	eval := New(knowledge.NewCatalog())
+
+	domains := []struct {
+		name               string
+		domain             model.DomainCategory
+		disallowedKeywords []string
+		expectedTraceTerms []string
+	}{
+		{
+			name:               "E-Commerce Domain",
+			domain:             model.DomainECommerce,
+			disallowedKeywords: []string{"volunteer", "certificate", "delegate", "attendance"},
+			expectedTraceTerms: []string{"order", "checkout"},
+		},
+		{
+			name:               "FinTech Domain",
+			domain:             model.DomainFinTech,
+			disallowedKeywords: []string{"volunteer", "certificate", "delegate", "attendance"},
+			expectedTraceTerms: []string{"ledger", "transfer", "double spending"},
+		},
+		{
+			name:               "Generic CRUD Domain",
+			domain:             model.DomainGeneralCRUD,
+			disallowedKeywords: []string{"volunteer", "certificate", "delegate", "attendance"},
+			expectedTraceTerms: []string{"duplicate", "unique"},
+		},
+		{
+			name:               "Event Management Domain",
+			domain:             model.DomainEventManagement,
+			disallowedKeywords: []string{},
+			expectedTraceTerms: []string{"attendance", "check-in"},
+		},
+	}
+
+	for _, tt := range domains {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &model.NormalizedRequirements{
+				ProjectName: "App_" + string(tt.domain),
+				Domain:      tt.domain,
+				Traffic:     model.TrafficProfile{ExpectedRPS: 50, PeakRPS: 150},
+				Data:        model.DataProfile{RequiresACID: true},
+				Invariants: model.BusinessInvariants{
+					PreventDuplicates:       true,
+					RequiresIdempotency:     true,
+					RequiresOfflineHandling: true,
+					AsyncOperations:         []string{"notification_dispatch"},
+				},
+			}
+			class := &model.ClassificationResult{
+				ActiveTraits: []model.WorkloadTrait{model.TraitTransactionHeavy},
+			}
+
+			summary := eval.Evaluate(req, class)
+
+			for _, trace := range summary.DecisionTraces {
+				allTraceText := trace.Decision + " " + trace.EvidenceAndProvenance
+				for _, reqText := range trace.SupportingRequirements {
+					allTraceText += " " + reqText
+				}
+				for _, rej := range trace.RejectedReasons {
+					allTraceText += " " + rej
+				}
+
+				// Verify disallowed domain keywords do not leak into this trace
+				for _, kw := range tt.disallowedKeywords {
+					lowerTrace := trace.Decision + " " + trace.EvidenceAndProvenance
+					for _, r := range trace.SupportingRequirements {
+						lowerTrace += " " + r
+					}
+					for _, r := range trace.RejectedReasons {
+						lowerTrace += " " + r
+					}
+					if strings.Contains(strings.ToLower(lowerTrace), kw) {
+						t.Errorf("domain %s decision trace %q leaked forbidden conference keyword %q: %s",
+							tt.domain, trace.Decision, kw, lowerTrace)
+					}
+				}
+			}
+		})
 	}
 }

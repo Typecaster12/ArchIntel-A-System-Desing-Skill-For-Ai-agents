@@ -70,4 +70,7 @@ type ValidationReport struct {
 
 	// Summary is a human-readable summary of the evaluation.
 	Summary string `json:"summary"`
+
+	// Limitations notes known boundaries or interprocedural uncertainties encountered during analysis.
+	Limitations []string `json:"limitations,omitempty"`
 }

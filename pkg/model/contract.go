@@ -204,6 +204,39 @@ type QueueRules struct {
 
 	// CrashRecoveryBehavior details how worker restart safely picks up pending or in-flight events.
 	CrashRecoveryBehavior string `json:"crash_recovery_behavior,omitempty"`
+
+	// JobClaimMechanism documents the SQL query and concurrency mechanics for atomic claiming.
+	JobClaimMechanism string `json:"job_claim_mechanism,omitempty"`
+
+	// ClaimLeaseDuration notes the duration after which an uncompleted job can be reclaimed by another worker.
+	ClaimLeaseDuration string `json:"claim_lease_duration,omitempty"`
+
+	// LeaseRenewalPolicy defines heartbeat renewal mechanics for long-running jobs (e.g. bulk certificates).
+	LeaseRenewalPolicy string `json:"lease_renewal_policy,omitempty"`
+
+	// FencingTokenMechanism defines stale worker rejection mechanics upon completion.
+	FencingTokenMechanism string `json:"fencing_token_mechanism,omitempty"`
+
+	// ProviderIntegrations details provider-specific idempotency, retention, and ambiguous timeout reconciliation.
+	ProviderIntegrations []ProviderIdempotencySpec `json:"provider_integrations,omitempty"`
+}
+
+// ProviderIdempotencySpec documents integration-specific idempotency, retention windows, and reconciliation strategies.
+type ProviderIdempotencySpec struct {
+	// ProviderName identifies the external service or subsystem (e.g. "Stripe", "SendGrid", "S3/BlobStore").
+	ProviderName string `json:"provider_name"`
+
+	// Mechanism explains the deduplication method (e.g. "HEADER_IDEMPOTENCY_KEY", "DETERMINISTIC_BLOB_PATH", "WEBHOOK_RECONCILIATION").
+	Mechanism string `json:"mechanism"`
+
+	// TokenFormat describes the format or composition of the idempotency token.
+	TokenFormat string `json:"token_format"`
+
+	// RetentionWindow notes how long the external service retains deduplication records.
+	RetentionWindow string `json:"retention_window"`
+
+	// AmbiguousTimeoutPlan explains recovery when a network timeout leaves external execution state uncertain.
+	AmbiguousTimeoutPlan string `json:"ambiguous_timeout_plan"`
 }
 
 // CapacityPlan documents connection pool and worker sizing derivations using Little's Law.
@@ -249,6 +282,9 @@ type CapacityPlan struct {
 type OfflineSyncStrategy struct {
 	// Policy is the chosen or proposed conflict resolution policy.
 	Policy string `json:"policy"`
+
+	// HandlingState categorizes requirement certainty ("CONFIRMED_REQUIRED", "RECOMMENDED_PROVISIONAL").
+	HandlingState string `json:"handling_state,omitempty"`
 
 	// ScanEventIdentity defines the stable client UUID assigned per physical scan event.
 	ScanEventIdentity string `json:"scan_event_identity"`
@@ -387,6 +423,9 @@ type ArchitectureContract struct {
 
 	// ActiveAssumptions notes non-blocking assumptions the agent must keep in mind.
 	ActiveAssumptions []string `json:"active_assumptions"`
+
+	// UnresolvedDecisions records material questions and provisional assumptions identified by gap analysis.
+	UnresolvedDecisions []string `json:"unresolved_decisions,omitempty"`
 }
 
 // Validate verifies that the contract contains all mandatory sections and valid values.
@@ -437,8 +476,17 @@ func (c *ArchitectureContract) ValidateConsistency() error {
 	}
 
 	// 3. Idempotency rule agreement:
-	// If requires_idempotency_key is true, an idempotency constraint must exist.
+	// Top-level flag and detailed policy must agree
+	if c.Data.RequiresIdempotencyKey != c.Data.IdempotencyPolicy.Required {
+		return errors.New("contract contradiction: data.requires_idempotency_key does not agree with data.idempotency_policy.required")
+	}
 	if c.Data.RequiresIdempotencyKey {
+		if c.Data.IdempotencyPolicy.FingerprintMechanism == "" {
+			return errors.New("contract contradiction: idempotency is required but idempotency_policy.fingerprint_mechanism is missing")
+		}
+		if c.Data.IdempotencyPolicy.StateStorageMechanism == "" {
+			return errors.New("contract contradiction: idempotency is required but idempotency_policy.state_storage_mechanism is missing")
+		}
 		hasIdempConstraint := false
 		for _, rule := range c.Constraints {
 			if strings.Contains(strings.ToLower(rule.Rule), "idempotency") {
@@ -448,6 +496,9 @@ func (c *ArchitectureContract) ValidateConsistency() error {
 		}
 		if !hasIdempConstraint {
 			return errors.New("contract contradiction: data.requires_idempotency_key is true but no idempotency constraint is defined")
+		}
+		if len(c.Data.IdempotencyPolicy.ApplicableOperations) == 0 {
+			return errors.New("contract contradiction: data.requires_idempotency_key is true but data.idempotency_policy.applicable_operations is empty")
 		}
 	}
 
@@ -466,10 +517,23 @@ func (c *ArchitectureContract) ValidateConsistency() error {
 	}
 
 	// 5. ACID outbox consistency:
-	// Transactional outbox requires atomic database transaction capability.
+	// Transactional outbox requires atomic database transaction capability and an enabled queue.
 	if c.Data.RequiresOutboxPattern {
 		if !c.Data.RequiresACID && !c.Data.TransactionPolicy.RequiresACID {
 			return errors.New("contract contradiction: data.requires_outbox_pattern is true but data.requires_acid is false (outbox requires atomic multi-step database transactions)")
+		}
+		if !c.Queue.Enabled {
+			return errors.New("contract contradiction: data.requires_outbox_pattern is true but queue.enabled is false (transactional outbox requires an active queue/worker mechanism to dispatch events)")
+		}
+	}
+
+	// 5b. Required persistence and transaction settings:
+	if c.Data.RequiresACID {
+		if strings.TrimSpace(c.Data.TransactionPolicy.Scope) == "" {
+			return errors.New("contract contradiction: data.requires_acid is true but data.transaction_policy.scope is missing or empty")
+		}
+		if strings.TrimSpace(c.Data.IsolationLevel) == "" && strings.TrimSpace(c.Data.ConcurrencyDetails.IsolationLevel) == "" {
+			return errors.New("contract contradiction: data.requires_acid is true but transaction isolation_level is missing or empty")
 		}
 	}
 
@@ -535,13 +599,66 @@ func (c *ArchitectureContract) ValidateConsistency() error {
 		}
 	}
 
-	// 12. Idempotency policy coherence
-	if c.Data.RequiresIdempotencyKey && c.Data.IdempotencyPolicy.Required {
-		if c.Data.IdempotencyPolicy.FingerprintMechanism == "" {
-			return errors.New("contract contradiction: idempotency is required but idempotency_policy.fingerprint_mechanism is missing")
+	// 12. Worker concurrency consistency across queue and capacity plan
+	if c.Queue.Enabled && c.CapacityPlan.WorkerConcurrencyMax > 0 {
+		if c.Queue.MaxWorkerConcurrency != c.CapacityPlan.WorkerConcurrencyMax {
+			return fmt.Errorf("contract contradiction: queue.max_worker_concurrency (%d) does not match capacity_plan.worker_concurrency_max (%d)",
+				c.Queue.MaxWorkerConcurrency, c.CapacityPlan.WorkerConcurrencyMax)
 		}
-		if c.Data.IdempotencyPolicy.StateStorageMechanism == "" {
-			return errors.New("contract contradiction: idempotency is required but idempotency_policy.state_storage_mechanism is missing")
+	}
+
+	// 13. Queue worker viability:
+	// An enabled queue requires a defined queue mechanism and at least one worker component.
+	if c.Queue.Enabled {
+		if strings.TrimSpace(c.Queue.QueueMechanism) == "" {
+			return errors.New("contract contradiction: queue.enabled is true but queue.queue_mechanism is missing or empty")
+		}
+		hasWorkerComp := false
+		for _, comp := range c.Components {
+			nameLower := strings.ToLower(comp.Name)
+			if strings.Contains(nameLower, "worker") || strings.Contains(nameLower, "dispatcher") || strings.Contains(nameLower, "consumer") {
+				hasWorkerComp = true
+				break
+			}
+			for _, resp := range comp.Responsibilities {
+				respLower := strings.ToLower(resp)
+				if strings.Contains(respLower, "worker") || strings.Contains(respLower, "process queue") || strings.Contains(respLower, "consume") || strings.Contains(respLower, "dispatch") {
+					hasWorkerComp = true
+					break
+				}
+			}
+		}
+		if !hasWorkerComp {
+			return errors.New("contract contradiction: queue.enabled is true but no worker or background processor component is configured in components")
+		}
+	}
+
+	// 14. Operational connection pool and worker concurrency compatibility
+	// Account for whether web handlers and workers share a connection pool, whether connections are held concurrently,
+	// and whether limits are operationally compatible.
+	if c.Queue.Enabled && c.Data.ConnectionPoolMax > 0 && c.Queue.MaxWorkerConcurrency > 0 {
+		workersUseDB := c.Queue.QueueMechanism == "POSTGRES_SKIP_LOCKED"
+		webHandlersUseDB := false
+		for _, comp := range c.Components {
+			nameLower := strings.ToLower(comp.Name)
+			isWorker := strings.Contains(nameLower, "worker") || strings.Contains(nameLower, "dispatcher") || strings.Contains(nameLower, "consumer")
+			if isWorker && comp.PersistenceAccess {
+				workersUseDB = true
+			}
+			if !isWorker && comp.PersistenceAccess {
+				webHandlersUseDB = true
+			}
+		}
+
+		if workersUseDB {
+			if c.Data.ConnectionPoolMax < c.Queue.MaxWorkerConcurrency {
+				return fmt.Errorf("contract contradiction: data.connection_pool_max (%d) is strictly less than queue.max_worker_concurrency (%d) while workers access the database; worker pool will starve connection pool",
+					c.Data.ConnectionPoolMax, c.Queue.MaxWorkerConcurrency)
+			}
+			if webHandlersUseDB && c.Data.ConnectionPoolMax == c.Queue.MaxWorkerConcurrency {
+				return fmt.Errorf("contract contradiction: data.connection_pool_max (%d) equals queue.max_worker_concurrency (%d) while web handlers and workers share the database connection pool; leaves no headroom for web traffic during worker saturation",
+					c.Data.ConnectionPoolMax, c.Queue.MaxWorkerConcurrency)
+			}
 		}
 	}
 

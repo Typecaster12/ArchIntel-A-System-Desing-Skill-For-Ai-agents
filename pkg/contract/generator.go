@@ -32,6 +32,24 @@ func (g *Generator) Generate(
 		summary.RecommendedDataRules.TransactionPolicy.RequiresACID = true
 	}
 
+	// Reconcile idempotency requirements
+	if summary.RecommendedDataRules.RequiresIdempotencyKey {
+		summary.RecommendedDataRules.IdempotencyPolicy.Required = true
+		if summary.RecommendedDataRules.IdempotencyPolicy.FingerprintMechanism == "" {
+			summary.RecommendedDataRules.IdempotencyPolicy.FingerprintMechanism = "SHA-256 hash of HTTP request body + target path"
+		}
+		if summary.RecommendedDataRules.IdempotencyPolicy.StateStorageMechanism == "" {
+			summary.RecommendedDataRules.IdempotencyPolicy.StateStorageMechanism = "PostgreSQL table 'idempotency_keys' with unique key and status (IN_PROGRESS, COMPLETED, FAILED)"
+		}
+	} else if summary.RecommendedDataRules.IdempotencyPolicy.Required {
+		summary.RecommendedDataRules.RequiresIdempotencyKey = true
+	}
+
+	// Reconcile capacity plan worker concurrency with queue rules
+	if summary.RecommendedQueueRules.Enabled && summary.CapacityPlan.WorkerConcurrencyMax == 0 {
+		summary.CapacityPlan.WorkerConcurrencyMax = summary.RecommendedQueueRules.MaxWorkerConcurrency
+	}
+
 	contract := &model.ArchitectureContract{
 		ContractVersion: "1.0.0",
 		ProjectName:     req.ProjectName,

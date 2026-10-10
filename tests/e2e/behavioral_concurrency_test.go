@@ -597,3 +597,245 @@ func TestExternalSideEffectDeliveryAndWorkerCrash(t *testing.T) {
 		t.Fatalf("provider side-effect duplicated: expected 1 unique token executed, got %d", len(providerProcessedTokens))
 	}
 }
+
+// I. PostgreSQL Atomic Job Claiming Race Between Concurrent Workers
+func TestPostgresAtomicJobClaimRace(t *testing.T) {
+	type OutboxRow struct {
+		ID             string
+		Status         string // PENDING, IN_PROGRESS, PROCESSED
+		ClaimedBy      string
+		ClaimToken     string
+		LeaseExpiresAt time.Time
+		AttemptCount   int
+	}
+
+	var mu sync.Mutex
+	table := map[string]*OutboxRow{
+		"job-101": {
+			ID:     "job-101",
+			Status: "PENDING",
+		},
+	}
+
+	// Simulates:
+	// WITH available AS (
+	//   SELECT id FROM outbox_events WHERE status = 'PENDING' OR (status = 'IN_PROGRESS' AND lease_expires_at < NOW())
+	//   FOR UPDATE SKIP LOCKED LIMIT 1
+	// )
+	// UPDATE outbox_events e SET status = 'IN_PROGRESS', claimed_by = $1, claim_token = $2, ...
+	// RETURNING ...
+	atomicClaim := func(workerID, token string, leaseDuration time.Duration) *OutboxRow {
+		mu.Lock()
+		defer mu.Unlock()
+
+		row, exists := table["job-101"]
+		if !exists {
+			return nil
+		}
+
+		now := time.Now()
+		isAvailable := row.Status == "PENDING" || (row.Status == "IN_PROGRESS" && now.After(row.LeaseExpiresAt))
+		if !isAvailable {
+			return nil // Row locked or currently leased by another active worker
+		}
+
+		// Atomic claim update
+		row.Status = "IN_PROGRESS"
+		row.ClaimedBy = workerID
+		row.ClaimToken = token
+		row.LeaseExpiresAt = now.Add(leaseDuration)
+		row.AttemptCount++
+
+		return &OutboxRow{
+			ID:             row.ID,
+			Status:         row.Status,
+			ClaimedBy:      row.ClaimedBy,
+			ClaimToken:     row.ClaimToken,
+			LeaseExpiresAt: row.LeaseExpiresAt,
+			AttemptCount:   row.AttemptCount,
+		}
+	}
+
+	// Two workers race concurrently to claim the single available job
+	var wg sync.WaitGroup
+	claims := make([]*OutboxRow, 2)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		claims[0] = atomicClaim("worker-A", "token-A", 10*time.Second)
+	}()
+	go func() {
+		defer wg.Done()
+		claims[1] = atomicClaim("worker-B", "token-B", 10*time.Second)
+	}()
+	wg.Wait()
+
+	// Exactly one worker must win the claim; the other gets nil (SKIP LOCKED)
+	wins := 0
+	for _, c := range claims {
+		if c != nil {
+			wins++
+		}
+	}
+
+	if wins != 1 {
+		t.Fatalf("expected exactly 1 worker to claim job-101, got %d winners", wins)
+	}
+
+	if table["job-101"].Status != "IN_PROGRESS" {
+		t.Fatalf("expected job status to be IN_PROGRESS, got %s", table["job-101"].Status)
+	}
+	if table["job-101"].AttemptCount != 1 {
+		t.Fatalf("expected attempt count 1, got %d", table["job-101"].AttemptCount)
+	}
+}
+
+// J. Lease Expiration, Reclaim, and Fencing Token Protection
+func TestLeaseExpirationAndStaleWorkerFencing(t *testing.T) {
+	type OutboxRow struct {
+		ID             string
+		Status         string // PENDING, IN_PROGRESS, PROCESSED
+		ClaimedBy      string
+		ClaimToken     string
+		LeaseExpiresAt time.Time
+		AttemptCount   int
+	}
+
+	var mu sync.Mutex
+	row := &OutboxRow{
+		ID:     "cert-gen-job",
+		Status: "PENDING",
+	}
+
+	atomicClaim := func(workerID, token string, leaseDuration time.Duration) *OutboxRow {
+		mu.Lock()
+		defer mu.Unlock()
+
+		now := time.Now()
+		isAvailable := row.Status == "PENDING" || (row.Status == "IN_PROGRESS" && now.After(row.LeaseExpiresAt))
+		if !isAvailable {
+			return nil
+		}
+
+		row.Status = "IN_PROGRESS"
+		row.ClaimedBy = workerID
+		row.ClaimToken = token
+		row.LeaseExpiresAt = now.Add(leaseDuration)
+		row.AttemptCount++
+
+		return &OutboxRow{
+			ID:             row.ID,
+			Status:         row.Status,
+			ClaimedBy:      row.ClaimedBy,
+			ClaimToken:     row.ClaimToken,
+			LeaseExpiresAt: row.LeaseExpiresAt,
+			AttemptCount:   row.AttemptCount,
+		}
+	}
+
+	// Completion update with fencing token:
+	// UPDATE outbox_events SET status = 'PROCESSED' WHERE id = $1 AND claim_token = $2
+	// Returns rows_affected
+	atomicComplete := func(token string) int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if row.ID == "cert-gen-job" && row.ClaimToken == token && row.Status == "IN_PROGRESS" {
+			row.Status = "PROCESSED"
+			return 1 // Successful commit
+		}
+		return 0 // Stale update rejected by fencing token!
+	}
+
+	// Step 1: Worker 1 claims job with a short 20ms lease
+	w1 := atomicClaim("worker-1", "token-w1-111", 20*time.Millisecond)
+	if w1 == nil || w1.ClaimToken != "token-w1-111" {
+		t.Fatalf("expected worker-1 to claim job")
+	}
+
+	// Step 2: Worker 1 pauses / hangs longer than lease duration (50ms)
+	time.Sleep(40 * time.Millisecond)
+
+	// Step 3: Worker 2 detects expired lease and reclaims job with new token
+	w2 := atomicClaim("worker-2", "token-w2-222", 50*time.Millisecond)
+	if w2 == nil || w2.ClaimToken != "token-w2-222" {
+		t.Fatalf("expected worker-2 to reclaim expired job")
+	}
+	if w2.AttemptCount != 2 {
+		t.Fatalf("expected attempt count 2, got %d", w2.AttemptCount)
+	}
+
+	// Step 4: Stale Worker 1 wakes up and attempts to commit completion
+	rowsAffectedW1 := atomicComplete("token-w1-111")
+	if rowsAffectedW1 != 0 {
+		t.Fatalf("fencing token failed: stale worker-1 completion should affect 0 rows, got %d", rowsAffectedW1)
+	}
+
+	// In database, job must still belong to Worker 2 (IN_PROGRESS)
+	if row.Status != "IN_PROGRESS" || row.ClaimToken != "token-w2-222" {
+		t.Fatalf("stale worker corrupted job state: status=%s, token=%s", row.Status, row.ClaimToken)
+	}
+
+	// Step 5: Worker 2 finishes and commits with valid fencing token
+	rowsAffectedW2 := atomicComplete("token-w2-222")
+	if rowsAffectedW2 != 1 {
+		t.Fatalf("expected worker-2 completion to succeed with 1 row affected, got %d", rowsAffectedW2)
+	}
+
+	if row.Status != "PROCESSED" {
+		t.Fatalf("expected final status PROCESSED, got %s", row.Status)
+	}
+}
+
+// K. Heartbeat Lease Renewal for Long-Running Tasks
+func TestHeartbeatLeaseRenewal(t *testing.T) {
+	type OutboxRow struct {
+		ID             string
+		Status         string
+		ClaimToken     string
+		LeaseExpiresAt time.Time
+	}
+
+	var mu sync.Mutex
+	row := &OutboxRow{
+		ID:             "long-pdf-job",
+		Status:         "IN_PROGRESS",
+		ClaimToken:     "worker-token-active",
+		LeaseExpiresAt: time.Now().Add(25 * time.Millisecond),
+	}
+
+	heartbeatRenew := func(token string, extension time.Duration) bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if row.ClaimToken == token && row.Status == "IN_PROGRESS" {
+			row.LeaseExpiresAt = time.Now().Add(extension)
+			return true
+		}
+		return false
+	}
+
+	tryReclaim := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return time.Now().After(row.LeaseExpiresAt)
+	}
+
+	// Sleep 15ms (lease still valid)
+	time.Sleep(15 * time.Millisecond)
+
+	// Renew lease for another 50ms
+	ok := heartbeatRenew("worker-token-active", 50*time.Millisecond)
+	if !ok {
+		t.Fatal("heartbeat renewal should succeed")
+	}
+
+	// Sleep another 20ms (total 35ms from start; initial 25ms would have expired without renewal)
+	time.Sleep(20 * time.Millisecond)
+
+	// Another worker checks if reclaimable
+	if tryReclaim() {
+		t.Fatal("job should NOT be reclaimable while heartbeat keeps lease active")
+	}
+}

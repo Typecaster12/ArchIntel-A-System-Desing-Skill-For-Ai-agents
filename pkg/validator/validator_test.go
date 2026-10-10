@@ -293,3 +293,204 @@ func PollOutbox(ctx context.Context) {
 		t.Errorf("expected 0 errors, got %d", report.ErrorsCount)
 	}
 }
+
+func TestValidator_HardenedASTAndFalsePositiveResistance(t *testing.T) {
+	v := New()
+	contract := &model.ArchitectureContract{
+		ContractVersion: "1.0.0",
+		ProjectName:     "HardenedApp",
+		Data: model.DataRules{
+			RequiresIdempotencyKey: true,
+			RequiresOutboxPattern:  true,
+			UniquenessStrategy:     "UNIQUE(order_id, user_id)",
+		},
+		Queue: model.QueueRules{
+			Enabled:        true,
+			QueueMechanism: "POSTGRES_SKIP_LOCKED",
+		},
+	}
+
+	t.Run("false positive resistance: separate functions in same file do not trigger sync http in tx", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/service/account.go",
+					Content: `package service
+func UpdateBalance() {
+	tx, _ := db.Begin()
+	tx.Commit()
+}
+func FetchExchangeRate() {
+	http.Get("https://api.rates.com")
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-SYNC-HTTP-IN-TX" {
+				t.Fatalf("unexpected false positive VIOL-SYNC-HTTP-IN-TX across separate functions")
+			}
+		}
+	})
+
+	t.Run("false positive resistance: comment containing http.get and tx.begin does not trigger violation", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/service/clean.go",
+					Content: `package service
+// Note: never invoke http.Get inside tx.Begin block
+func CleanLogic() {
+	log.Println("performing safe operation")
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-SYNC-HTTP-IN-TX" {
+				t.Fatalf("unexpected false positive VIOL-SYNC-HTTP-IN-TX triggered by comment")
+			}
+		}
+	})
+
+	t.Run("positive detection: helper function inside transaction making outbound HTTP call is caught", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/service/checkout.go",
+					Content: `package service
+func callStripeAPI() {
+	http.Post("https://stripe.com/api", "application/json", nil)
+}
+func ProcessCheckout() {
+	tx, _ := db.Begin()
+	callStripeAPI()
+	tx.Commit()
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		found := false
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-SYNC-HTTP-IN-TX" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected VIOL-SYNC-HTTP-IN-TX for helper call inside transaction")
+		}
+	})
+
+	t.Run("bypass resistance: comment containing workerpool does not bypass unbounded goroutine check", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/handler/order_handler.go",
+					Content: `package handler
+func HandleOrder(w http.ResponseWriter, r *http.Request) {
+	// workerpool comment attempt to bypass check
+	go func() {
+		processAsync()
+	}()
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		found := false
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-AST-UNBOUNDED-GOROUTINE" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected VIOL-AST-UNBOUNDED-GOROUTINE despite misleading comment")
+		}
+	})
+
+	t.Run("bounded concurrency: semaphore channel in handler is permitted", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/handler/bounded_handler.go",
+					Content: `package handler
+var sem = make(chan struct{}, 10)
+func HandleBounded(w http.ResponseWriter, r *http.Request) {
+	sem <- struct{}{}
+	go func() {
+		defer func() { <-sem }()
+		processAsync()
+	}()
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-AST-UNBOUNDED-GOROUTINE" {
+				t.Fatalf("unexpected violation: semaphore-bounded goroutine should be permitted")
+			}
+		}
+	})
+
+	t.Run("nonstandard path: api package handler caught for direct SQL and idempotency", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "pkg/api/payments.go",
+					Content: `package api
+func ChargePayment(w http.ResponseWriter, r *http.Request) {
+	db.Query("SELECT * FROM payments WHERE id = 1")
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		foundSQL := false
+		foundIdemp := false
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-DB-IN-HANDLER" {
+				foundSQL = true
+			}
+			if viol.RuleID == "VIOL-MISSING-HANDLER-IDEMPOTENCY" {
+				foundIdemp = true
+			}
+		}
+		if !foundSQL {
+			t.Fatalf("expected VIOL-DB-IN-HANDLER in nonstandard path pkg/api")
+		}
+		if !foundIdemp {
+			t.Fatalf("expected VIOL-MISSING-HANDLER-IDEMPOTENCY in mutating endpoint in pkg/api")
+		}
+	})
+
+	t.Run("generalized table: non-conference table caught for missing ON CONFLICT", func(t *testing.T) {
+		prop := ImplementationProposal{
+			Files: []CodeFileProposal{
+				{
+					Path: "internal/repo/order_repo.go",
+					Content: `package repo
+func CreateOrder() {
+	db.Exec("INSERT INTO orders (order_id, user_id) VALUES ($1, $2)")
+}`,
+				},
+			},
+		}
+		rep := v.Validate(contract, prop)
+		found := false
+		for _, viol := range rep.Violations {
+			if viol.RuleID == "VIOL-NON-ATOMIC-DUPLICATE-CHECK" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected VIOL-NON-ATOMIC-DUPLICATE-CHECK on generalized orders table")
+		}
+	})
+}

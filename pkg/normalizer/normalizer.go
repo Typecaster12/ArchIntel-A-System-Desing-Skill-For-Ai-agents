@@ -11,12 +11,16 @@ import (
 
 var (
 	// Regex patterns for detecting traffic and scale specifications.
-	rpsRegex           = regexp.MustCompile(`(?i)([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)`)
-	dauRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:k|m|million|thousand)?\s*(?:dau|daily\s+active\s+users)`)
-	kNumRegex          = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*k`)
-	mNumRegex          = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:m|million)`)
-	attendeeRegex      = regexp.MustCompile(`(?i)([\d,]+)\s*(?:registered\s+)?(?:delegates|attendees|participants|users|guests)`)
-	arrivalWindowRegex = regexp.MustCompile(`(?i)([\d,]+)(?:\s*(?:–|-|to)\s*([\d,]+))?\s*(?:attendees|delegates|arrivals|guests)?\s*arriving\s*within\s*(?:a\s*)?(\d+)[- ]minute`)
+	rpsRegex            = regexp.MustCompile(`(?i)([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)`)
+	baselineRPSRegex    = regexp.MustCompile(`(?i)(?:baseline|expected|average|avg|normal|steady-state)(?:\s*(?:load|throughput|traffic|rate))?(?:\s*(?:of|at|:|=|is))?\s*([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)?`)
+	peakRPSRegex        = regexp.MustCompile(`(?i)(?:peak|burst|maximum|max)(?:\s*(?:load|throughput|traffic|rate))?(?:\s*(?:of|at|:|=|is))?\s*([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)?`)
+	baselineRPSRevRegex = regexp.MustCompile(`(?i)([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)?\s*(?:baseline|expected|average|avg)`)
+	peakRPSRevRegex     = regexp.MustCompile(`(?i)([\d,]+(?:\.\d+)?)\s*(?:req(?:uests)?\/s(?:ec)?|rps)?\s*(?:peak|burst|maximum|max)`)
+	dauRegex            = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:k|m|million|thousand)?\s*(?:dau|daily\s+active\s+users)`)
+	kNumRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*k`)
+	mNumRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:m|million)`)
+	attendeeRegex       = regexp.MustCompile(`(?i)([\d,]+)\s*(?:registered\s+)?(?:delegates|attendees|participants|users|guests)`)
+	arrivalWindowRegex  = regexp.MustCompile(`(?i)([\d,]+)(?:\s*(?:–|-|to)\s*([\d,]+))?\s*(?:attendees|delegates|arrivals|guests)?\s*(?:arriving|check-?ins?|scans?)\s*(?:within|in|during)\s*(?:a\s*)?(\d+)[- ]minute`)
 
 	// Regex patterns for latency constraints.
 	latencyMsRegex = regexp.MustCompile(`(?i)(?:sub-?|<|under|within)?\s*(\d+)\s*ms`)
@@ -211,13 +215,57 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 	// Check explicit flag or stated traffic string first.
 	trafficText := promptLower + " " + strings.ToLower(raw.StatedTraffic)
 
-	// Check for direct RPS mentions (e.g. "500 RPS" or "2,000 RPS" or "200 req/s").
-	if match := rpsRegex.FindStringSubmatch(trafficText); len(match) > 1 {
+	// Check for separate explicit baseline and peak RPS mentions
+	var explicitBaseline float64
+	var explicitPeak float64
+
+	if m := baselineRPSRegex.FindStringSubmatch(trafficText); len(m) > 1 {
+		if val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", ""), 64); err == nil && val > 0 {
+			explicitBaseline = val
+		}
+	} else if m := baselineRPSRevRegex.FindStringSubmatch(trafficText); len(m) > 1 {
+		if val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", ""), 64); err == nil && val > 0 {
+			explicitBaseline = val
+		}
+	}
+
+	if m := peakRPSRegex.FindStringSubmatch(trafficText); len(m) > 1 {
+		if val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", ""), 64); err == nil && val > 0 {
+			explicitPeak = val
+		}
+	} else if m := peakRPSRevRegex.FindStringSubmatch(trafficText); len(m) > 1 {
+		if val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", ""), 64); err == nil && val > 0 {
+			explicitPeak = val
+		}
+	}
+
+	if explicitBaseline > 0 || explicitPeak > 0 {
+		profile.IsExplicit = true
+		profile.TrafficSource = "EXPLICIT_RPS"
+
+		if explicitBaseline > 0 && explicitPeak > 0 {
+			profile.ExpectedRPS = explicitBaseline
+			profile.PeakRPS = explicitPeak
+			profile.IsPeakExplicit = true
+			profile.DerivedRPSReason = fmt.Sprintf("Explicitly specified in prompt (baseline: %0.1f RPS, peak: %0.1f RPS)", explicitBaseline, explicitPeak)
+		} else if explicitBaseline > 0 {
+			profile.ExpectedRPS = explicitBaseline
+			profile.PeakRPS = explicitBaseline * 3.0 // Heuristic 3x peak multiplier
+			profile.IsPeakExplicit = false
+			profile.DerivedRPSReason = fmt.Sprintf("Explicit baseline specified in prompt (%0.0f RPS baseline, 3x heuristic peak %0.0f RPS)", explicitBaseline, profile.PeakRPS)
+		} else { // explicitPeak > 0
+			profile.PeakRPS = explicitPeak
+			profile.ExpectedRPS = explicitPeak / 3.0
+			profile.IsPeakExplicit = true
+			profile.DerivedRPSReason = fmt.Sprintf("Explicit peak specified in prompt (%0.1f RPS peak, estimated 1/3 baseline %0.1f RPS)", explicitPeak, profile.ExpectedRPS)
+		}
+	} else if match := rpsRegex.FindStringSubmatch(trafficText); len(match) > 1 {
 		cleanedRPS := strings.ReplaceAll(match[1], ",", "")
 		if val, err := strconv.ParseFloat(cleanedRPS, 64); err == nil && val > 0 {
 			profile.ExpectedRPS = val
 			profile.PeakRPS = val * 3.0 // Standard heuristic 3x peak multiplier
 			profile.IsExplicit = true
+			profile.IsPeakExplicit = false
 			profile.TrafficSource = "EXPLICIT_RPS"
 			profile.DerivedRPSReason = fmt.Sprintf("Explicitly specified in prompt (%0.0f RPS baseline, 3x peak)", val)
 		}
@@ -255,6 +303,7 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 			profile.PeakRPS = 15.0 // Estimated peak HTTP RPS for simultaneous QR scans, retries, and dashboard loads
 			profile.EstimatedHTTPRPS = 15.0
 			profile.IsExplicit = true
+			profile.IsBursty = true
 			profile.TrafficSource = "DERIVED_FROM_ARRIVALS"
 			profile.DerivedRPSReason = fmt.Sprintf(
 				"Physical arrival rate derived from %s (%0.2f arrivals/sec). Estimated peak HTTP traffic is 15-25 RPS to account for concurrent volunteer QR scans, device retries, schedule queries, and administrative dashboard refreshes.",
@@ -320,6 +369,8 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 		UniquenessTargets:           make([]string, 0),
 		RequiresIdempotency:         false,
 		RequiresOfflineHandling:     false,
+		OfflineHandlingState:        "NOT_SPECIFIED",
+		NetworkResilienceMode:       "NONE",
 		OfflineConflictPolicy:       "",
 		ExternalCallsInTxProhibited: true,
 		AsyncOperations:             make([]string, 0),
@@ -327,6 +378,7 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 
 	// 1. Duplicate prevention
 	if strings.Contains(promptLower, "prevent duplicate") ||
+		strings.Contains(promptLower, "prevent duplicates") ||
 		strings.Contains(promptLower, "cannot check in multiple times") ||
 		strings.Contains(promptLower, "cannot check in twice") ||
 		strings.Contains(promptLower, "duplicate attendance") ||
@@ -350,6 +402,10 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 	if strings.Contains(promptLower, "idempotent") ||
 		strings.Contains(promptLower, "network interruption") ||
 		strings.Contains(promptLower, "network failure") ||
+		strings.Contains(promptLower, "unstable") ||
+		strings.Contains(promptLower, "temporarily unavailable") ||
+		strings.Contains(promptLower, "intermittent") ||
+		strings.Contains(promptLower, "connectivity") ||
 		strings.Contains(promptLower, "simultaneously from different devices") ||
 		strings.Contains(promptLower, "simultaneous") ||
 		strings.Contains(promptLower, "retry") ||
@@ -358,12 +414,29 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 		inv.RequiresIdempotency = true
 	}
 
-	// 3. Offline handling
+	// 3. Offline handling & network failure classification
 	if strings.Contains(promptLower, "offline") ||
-		strings.Contains(promptLower, "temporary network interruption") ||
-		strings.Contains(promptLower, "network interruptions") {
+		strings.Contains(promptLower, "local buffering") ||
+		strings.Contains(promptLower, "buffer offline") {
 		inv.RequiresOfflineHandling = true
+		inv.OfflineHandlingState = "CONFIRMED_REQUIRED"
+		inv.NetworkResilienceMode = "OFFLINE_FIRST_MANDATORY"
 		inv.OfflineConflictPolicy = "SERVER_FIRST_WRITE_WINS"
+	} else if strings.Contains(promptLower, "temporary network interruption") ||
+		strings.Contains(promptLower, "network interruptions") ||
+		strings.Contains(promptLower, "temporarily unavailable") ||
+		strings.Contains(promptLower, "unstable") ||
+		strings.Contains(promptLower, "intermittent connectivity") ||
+		strings.Contains(promptLower, "connectivity in the venue may be unstable") ||
+		strings.Contains(promptLower, "connectivity") {
+		inv.RequiresOfflineHandling = true
+		inv.OfflineHandlingState = "RECOMMENDED_PROVISIONAL"
+		inv.NetworkResilienceMode = "OFFLINE_BUFFER_RECOMMENDED"
+		inv.OfflineConflictPolicy = "SERVER_FIRST_WRITE_WINS"
+	} else {
+		inv.RequiresOfflineHandling = false
+		inv.OfflineHandlingState = "NOT_SPECIFIED"
+		inv.NetworkResilienceMode = "NONE"
 	}
 
 	// 4. Async operations
@@ -375,6 +448,17 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 	}
 	if strings.Contains(promptLower, "export") || strings.Contains(promptLower, "report") {
 		inv.AsyncOperations = append(inv.AsyncOperations, "attendance reports")
+	}
+	if strings.Contains(promptLower, "background") || strings.Contains(promptLower, "async") {
+		hasGeneralAsync := false
+		for _, op := range inv.AsyncOperations {
+			if op == "asynchronous background tasks" {
+				hasGeneralAsync = true
+			}
+		}
+		if !hasGeneralAsync && len(inv.AsyncOperations) == 0 {
+			inv.AsyncOperations = append(inv.AsyncOperations, "asynchronous background tasks")
+		}
 	}
 
 	return inv
@@ -435,11 +519,20 @@ func buildFieldProvenance(norm *model.NormalizedRequirements, promptLower string
 			IsHardConstraint: true,
 			Confidence:       1.0,
 		}
-		prov["traffic.peak_rps"] = model.ProvenanceMeta{
-			Source:           model.ProvenanceDerived,
-			Method:           "Derived 3x burst multiplier over user-stated baseline RPS",
-			IsHardConstraint: false,
-			Confidence:       0.90,
+		if norm.Traffic.IsPeakExplicit {
+			prov["traffic.peak_rps"] = model.ProvenanceMeta{
+				Source:           model.ProvenanceUserProvided,
+				Method:           "Extracted directly from user prompt peak RPS specification",
+				IsHardConstraint: true,
+				Confidence:       1.0,
+			}
+		} else {
+			prov["traffic.peak_rps"] = model.ProvenanceMeta{
+				Source:           model.ProvenanceDerived,
+				Method:           "Derived 3x burst multiplier over user-stated baseline RPS",
+				IsHardConstraint: false,
+				Confidence:       0.90,
+			}
 		}
 	} else if norm.Traffic.TrafficSource == "DERIVED_FROM_ARRIVALS" {
 		prov["traffic.expected_rps"] = model.ProvenanceMeta{

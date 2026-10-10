@@ -38,9 +38,16 @@ func TestContractJSONSerializationAndValidation(t *testing.T) {
 			IsolationLevel:         "READ_COMMITTED",
 			Locking:                LockingPessimistic,
 			RequiresACID:           true,
+			TransactionPolicy:      TransactionPolicy{Scope: "PER_OPERATION_ATOMIC"},
 			RequiresIdempotencyKey: true,
-			RequiresOutboxPattern:  true,
-			ConnectionPoolMax:      25,
+			IdempotencyPolicy: IdempotencyPolicy{
+				Required:              true,
+				ApplicableOperations:  []string{"capture_payment"},
+				FingerprintMechanism:  "SHA-256",
+				StateStorageMechanism: "idempotency_keys",
+			},
+			RequiresOutboxPattern: true,
+			ConnectionPoolMax:     25,
 		},
 		Queue: QueueRules{
 			Enabled:              true,
@@ -49,6 +56,9 @@ func TestContractJSONSerializationAndValidation(t *testing.T) {
 			MaxRetryAttempts:     5,
 			BackoffStrategy:      "EXPONENTIAL_WITH_JITTER",
 			DeadLetterHandling:   "Store in failed_jobs table and fire alert",
+		},
+		CapacityPlan: CapacityPlan{
+			WorkerConcurrencyMax: 10,
 		},
 		Constraints: []ImplementationConstraint{
 			{
@@ -176,6 +186,11 @@ func TestContractValidationErrors(t *testing.T) {
 			name: "Idempotency Rule Agreement: requires_idempotency_key without constraint",
 			mutate: func(c *ArchitectureContract) {
 				c.Data.RequiresIdempotencyKey = true
+				c.Data.IdempotencyPolicy = IdempotencyPolicy{
+					Required:              true,
+					FingerprintMechanism:  "SHA-256 hash of request body",
+					StateStorageMechanism: "PostgreSQL idempotency_keys table",
+				}
 				c.Constraints = []ImplementationConstraint{}
 			},
 			wantErr: "contract contradiction: data.requires_idempotency_key is true but no idempotency constraint is defined",
@@ -247,6 +262,98 @@ func TestContractValidationErrors(t *testing.T) {
 				c.OfflineSync = nil
 			},
 			wantErr: "contract contradiction: component \"ScannerModule\" supports offline check-in but contract.offline_sync policy is missing",
+		},
+		{
+			name: "Idempotency flag and policy requirement disagreement",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresIdempotencyKey = true
+				c.Data.IdempotencyPolicy = IdempotencyPolicy{
+					Required: false,
+				}
+			},
+			wantErr: "contract contradiction: data.requires_idempotency_key does not agree with data.idempotency_policy.required",
+		},
+		{
+			name: "Worker concurrency mismatch across queue and capacity plan",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 8
+				c.CapacityPlan.WorkerConcurrencyMax = 20
+			},
+			wantErr: "contract contradiction: queue.max_worker_concurrency (8) does not match capacity_plan.worker_concurrency_max (20)",
+		},
+		{
+			name: "Required idempotency with empty applicable operations",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresIdempotencyKey = true
+				c.Data.IdempotencyPolicy = IdempotencyPolicy{
+					Required:              true,
+					ApplicableOperations:  []string{},
+					FingerprintMechanism:  "SHA-256",
+					StateStorageMechanism: "idempotency_keys",
+				}
+				c.Constraints = []ImplementationConstraint{
+					{Rule: "All mutating endpoints must require idempotency tokens"},
+				}
+			},
+			wantErr: "contract contradiction: data.requires_idempotency_key is true but data.idempotency_policy.applicable_operations is empty",
+		},
+		{
+			name: "Outbox pattern true while queue is disabled",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresOutboxPattern = true
+				c.Data.RequiresACID = true
+				c.Data.TransactionPolicy.RequiresACID = true
+				c.Data.TransactionPolicy.Scope = "PER_OPERATION_ATOMIC"
+				c.Queue.Enabled = false
+			},
+			wantErr: "contract contradiction: data.requires_outbox_pattern is true but queue.enabled is false (transactional outbox requires an active queue/worker mechanism to dispatch events)",
+		},
+		{
+			name: "Queue enabled without queue mechanism",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 5
+				c.Queue.QueueMechanism = ""
+			},
+			wantErr: "contract contradiction: queue.enabled is true but queue.queue_mechanism is missing or empty",
+		},
+		{
+			name: "Queue enabled without worker component",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 5
+				c.Queue.QueueMechanism = "POSTGRES_SKIP_LOCKED"
+				c.Components = []ComponentDefinition{{Name: "WebAPI", Responsibilities: []string{"Handle HTTP"}}}
+			},
+			wantErr: "contract contradiction: queue.enabled is true but no worker or background processor component is configured in components",
+		},
+		{
+			name: "Operational connection pool starvation: ConnectionPoolMax < MaxWorkerConcurrency with DB workers",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 15
+				c.Queue.QueueMechanism = "POSTGRES_SKIP_LOCKED"
+				c.Components = []ComponentDefinition{
+					{Name: "JobWorker", Responsibilities: []string{"Poll queue"}, PersistenceAccess: true},
+				}
+				c.Data.ConnectionPoolMax = 10
+			},
+			wantErr: "contract contradiction: data.connection_pool_max (10) is strictly less than queue.max_worker_concurrency (15) while workers access the database; worker pool will starve connection pool",
+		},
+		{
+			name: "Operational connection pool equal sizing with shared DB",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 10
+				c.Queue.QueueMechanism = "POSTGRES_SKIP_LOCKED"
+				c.Components = []ComponentDefinition{
+					{Name: "WebAPI", Responsibilities: []string{"Handle HTTP"}, PersistenceAccess: true},
+					{Name: "JobWorker", Responsibilities: []string{"Poll queue"}, PersistenceAccess: true},
+				}
+				c.Data.ConnectionPoolMax = 10
+			},
+			wantErr: "contract contradiction: data.connection_pool_max (10) equals queue.max_worker_concurrency (10) while web handlers and workers share the database connection pool; leaves no headroom for web traffic during worker saturation",
 		},
 	}
 

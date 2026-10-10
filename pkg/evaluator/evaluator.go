@@ -2,6 +2,7 @@ package evaluator
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/sdskill/archintel/pkg/knowledge"
 	"github.com/sdskill/archintel/pkg/model"
@@ -32,11 +33,19 @@ func (e *Evaluator) Evaluate(req *model.NormalizedRequirements, class *model.Cla
 	// 1. Evaluate Topology
 	summary.RecommendedTopology, summary.TopologyRationale = e.evaluateTopology(req, class)
 
+	// Determine bounded worker concurrency upfront to ensure consistency across rules and capacity plan
+	workerConcurrency := 10
+	if req.Traffic.PeakRPS > 500 {
+		workerConcurrency = 25
+	} else if len(req.Invariants.AsyncOperations) > 0 {
+		workerConcurrency = 8
+	}
+
 	// 2. Evaluate Data and Concurrency Rules
-	summary.RecommendedDataRules = e.evaluateDataRules(req, class)
+	summary.RecommendedDataRules = e.evaluateDataRules(req, class, workerConcurrency)
 
 	// 3. Evaluate Background Queue and Worker Rules
-	summary.RecommendedQueueRules = e.evaluateQueueRules(req, class, summary.RecommendedDataRules)
+	summary.RecommendedQueueRules = e.evaluateQueueRules(req, class, summary.RecommendedDataRules, workerConcurrency)
 
 	// 4. Evaluate Capacity Plan via Little's Law
 	summary.CapacityPlan = e.evaluateCapacityPlan(req, summary.RecommendedDataRules, summary.RecommendedQueueRules)
@@ -83,7 +92,7 @@ func (e *Evaluator) evaluateTopology(req *model.NormalizedRequirements, class *m
 }
 
 // evaluateDataRules deterministically assigns locking, isolation, and outbox rules.
-func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *model.ClassificationResult) model.DataRules {
+func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *model.ClassificationResult, workerConcurrency int) model.DataRules {
 	rules := model.DataRules{
 		IsolationLevel:         "READ_COMMITTED", // Safe default for PostgreSQL/MySQL
 		Locking:                model.LockingNone,
@@ -104,9 +113,16 @@ func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *
 	}
 
 	// 3. Database Uniqueness and Conflict Handling for duplicate prevention
-	if req.Invariants.PreventDuplicates {
-		rules.UniquenessStrategy = "DATABASE_UNIQUE_CONSTRAINT (e.g. compound unique index: UNIQUE (delegate_id, session_id))"
-		rules.ConflictHandling = "ATOMIC_INSERT_ON_CONFLICT (INSERT ... ON CONFLICT (delegate_id, session_id) DO NOTHING)"
+	if req.Domain == model.DomainEventManagement && req.Invariants.PreventDuplicates {
+		rules.UniquenessStrategy = "DATABASE_UNIQUE_CONSTRAINTS: 1) Delegate Registration: independent unique constraint UNIQUE(email) and primary key UNIQUE(delegate_id); 2) Session Attendance: compound unique constraint UNIQUE(delegate_id, session_id)"
+		rules.ConflictHandling = "ATOMIC_INSERT_ON_CONFLICT: Attendance check-in executes 'INSERT INTO attendance (delegate_id, session_id) VALUES ($1, $2) ON CONFLICT (delegate_id, session_id) DO NOTHING' returning duplicate detection status without error; Registration executes 'INSERT INTO delegates (email, name) ... ON CONFLICT (email) DO NOTHING'"
+	} else if req.Invariants.PreventDuplicates {
+		targetStr := "natural_business_keys"
+		if len(req.Invariants.UniquenessTargets) > 0 {
+			targetStr = strings.Join(req.Invariants.UniquenessTargets, ", ")
+		}
+		rules.UniquenessStrategy = fmt.Sprintf("DATABASE_UNIQUE_CONSTRAINT (e.g. compound unique index: UNIQUE (%s))", targetStr)
+		rules.ConflictHandling = fmt.Sprintf("ATOMIC_INSERT_ON_CONFLICT (INSERT ... ON CONFLICT (%s) DO NOTHING)", targetStr)
 	}
 
 	// 4. Concurrency Locking & Detailed Concurrency Control
@@ -190,7 +206,7 @@ func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *
 	}
 
 	// 6. Idempotency Key requirement & detailed IdempotencyPolicy
-	if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech || req.Invariants.RequiresIdempotency {
+	if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech || req.Invariants.RequiresIdempotency || req.Invariants.PreventDuplicates || req.Invariants.RequiresOfflineHandling {
 		rules.RequiresIdempotencyKey = true
 	}
 
@@ -200,25 +216,33 @@ func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *
 			applicableOps = append(applicableOps, "order_placement", "payment_capture", "refund_initiation")
 		} else if req.Domain == model.DomainFinTech {
 			applicableOps = append(applicableOps, "transfer_initiation", "payment_charge", "disbursement")
+		} else if req.Domain == model.DomainEventManagement {
+			applicableOps = append(applicableOps, "delegate_check_in", "delegate_registration", "certificate_generation_request")
+			if req.Invariants.RequiresOfflineHandling {
+				applicableOps = append(applicableOps, "offline_batch_sync_upload")
+			}
 		} else {
 			applicableOps = append(applicableOps, "financial_transaction", "state_mutation")
 		}
-	} else if req.Invariants.RequiresOfflineHandling {
-		applicableOps = append(applicableOps, "offline_batch_sync_upload")
+	}
+
+	keyScope := "HEADER_IDEMPOTENCY_KEY_SCOPED_BY_OPERATION_AND_TENANT"
+	if !rules.RequiresIdempotencyKey {
+		keyScope = "NOT_REQUIRED"
 	}
 
 	rules.IdempotencyPolicy = model.IdempotencyPolicy{
 		Required:                      rules.RequiresIdempotencyKey,
 		ApplicableOperations:          applicableOps,
-		KeyScope:                      "HEADER_IDEMPOTENCY_KEY_SCOPED_BY_OPERATION_AND_TENANT",
+		KeyScope:                      keyScope,
 		FingerprintMechanism:          "SHA-256 hash of canonical request method, path, and normalized body payload",
 		StateStorageMechanism:         "Durable relational table (idempotency_keys) recording key, payload_hash, status (IN_PROGRESS/COMPLETED), original_status_code, and serialized response body",
-		ConcurrentRequestHandling:     "Return HTTP 409 Conflict with 'Operation in progress' retry-after guidance or serialize execution via database row-level locking",
+		ConcurrentRequestHandling:     "Return HTTP 409 Conflict with Retry-After header while initial mutation is in progress; reject concurrent duplicate mutations until initial request resolves",
 		PayloadMismatchBehavior:       "Return HTTP 422 Unprocessable Entity rejecting key reuse with mismatched payload fingerprint",
 		ResponseReplayBehavior:        "Atomic replay of cached original HTTP status code and response body without re-executing business mutations",
-		RetentionPeriod:               "24 to 48 hours rolling retention with background purge",
+		RetentionPeriod:               "24 hours rolling retention with periodic background cleanup",
 		EnforcementValidationCriteria: "Verification requires proof of persistent idempotency state lookup, payload fingerprint comparison, and replayed response storage; inspecting request headers alone is insufficient",
-		DatabaseUniquenessAlternative: "Operations with natural domain uniqueness (such as attendance check-in on (delegate_id, session_id)) rely primarily on database UNIQUE constraints with atomic ON CONFLICT handling, avoiding unnecessary client idempotency token overhead",
+		DatabaseUniquenessAlternative: "Operations with natural domain uniqueness (such as attendance check-in on (delegate_id, session_id)) rely primarily on database UNIQUE constraints with atomic ON CONFLICT handling, while idempotency tokens guarantee safe response replay on transport retry without error",
 	}
 
 	// 7. Connection Pool Sizing via Little's Law (L = lambda * W)
@@ -241,8 +265,8 @@ func (e *Evaluator) evaluateDataRules(req *model.NormalizedRequirements, class *
 	} else {
 		rules.ConnectionPoolMax = 20
 		rules.PoolSizingRationale = fmt.Sprintf(
-			"Little's Law applied to DB query load: lambda=%0.0f queries/sec (est. 2 queries/request at conservative peak %0.0f HTTP RPS scenario), W=20ms avg query latency -> avg active DB concurrency L=%0.2f. Pool of 20 connections provides safe headroom for sudden traffic bursts and concurrent background worker connections (8 workers) without exhausting single-server cloud memory. Sizing represents a conservative planning estimate, not an empirical guarantee.",
-			estimatedDBRPS, req.Traffic.PeakRPS, estimatedAvgDBConcurrency,
+			"Little's Law applied to DB query load: lambda=%0.0f queries/sec (est. 2 queries/request at conservative peak %0.0f HTTP RPS scenario), W=20ms avg query latency -> avg active DB concurrency L=%0.2f. Pool of 20 connections provides safe headroom for sudden traffic bursts and concurrent background worker connections (%d workers) without exhausting single-server cloud memory. Sizing represents a conservative planning estimate, not an empirical guarantee.",
+			estimatedDBRPS, req.Traffic.PeakRPS, estimatedAvgDBConcurrency, workerConcurrency,
 		)
 	}
 
@@ -291,20 +315,43 @@ func (e *Evaluator) evaluateOfflineSync(req *model.NormalizedRequirements) *mode
 		return nil
 	}
 
+	handlingState := req.Invariants.OfflineHandlingState
+	if handlingState == "" {
+		handlingState = "RECOMMENDED_PROVISIONAL"
+	}
+	isDefault := (handlingState == "RECOMMENDED_PROVISIONAL")
+
+	scanIdent := "Stable client UUID v4 assigned uniquely per physical barcode/QR scan attempt and immutable across retries"
+	canonicalIdent := "Database compound unique constraint UNIQUE (delegate_id, session_id) on the attendance table enforcing single-admission invariant"
+	distinctDist := "Repeated transmission of the same physical scan reuses scan_event_id and is deduplicated in scan_events audit log; distinct physical scan attempts receive new scan_event_ids and are logged individually as conflicting attempts without corrupting canonical attendance"
+	rawVsCanon := "Raw scan attempts (including duplicates and conflicting offline scans) are appended to a raw 'scan_events' table; canonical attendance is enforced via database compound unique constraint on the 'attendance' table"
+	q1 := "Confirm whether earliest real-world scan timestamp is required instead of server-commit order if network sync is delayed for extended periods"
+	q2 := "Define maximum permissible offline buffering window before cached volunteer scan tokens expire"
+
+	if req.Domain != model.DomainEventManagement {
+		scanIdent = "Stable client UUID v4 assigned uniquely per offline mutation attempt and immutable across retries"
+		canonicalIdent = "Database unique constraints enforcing canonical entity state and invariant boundaries"
+		distinctDist = "Repeated transmission reuses client mutation token and is deduplicated via audit log; distinct attempts receive new tokens without corrupting canonical state"
+		rawVsCanon = "Raw mutation attempts are appended to an audit log; canonical entity state is enforced via database unique constraints"
+		q1 = "Confirm whether earliest client timestamp is required instead of server-commit order if network sync is delayed for extended periods"
+		q2 = "Define maximum permissible offline buffering window before cached client synchronization tokens expire"
+	}
+
 	return &model.OfflineSyncStrategy{
 		Policy:                         "SERVER_FIRST_WRITE_WINS_WITH_AUDIT_LOG",
-		ScanEventIdentity:              "Stable client UUID v4 assigned uniquely per physical barcode/QR scan attempt and immutable across retries",
+		HandlingState:                  handlingState,
+		ScanEventIdentity:              scanIdent,
 		RequestTransportIdempotency:    "HTTP transport Idempotency-Key protecting network batch uploads from duplicate transport transmission",
-		CanonicalAttendanceIdentity:    "Database compound unique constraint UNIQUE (delegate_id, session_id) on the attendance table enforcing single-admission invariant",
-		DistinctScanDistinguishability: "Repeated transmission of the same physical scan reuses scan_event_id and is deduplicated in scan_events audit log; distinct physical scan attempts receive new scan_event_ids and are logged individually as conflicting attempts without corrupting canonical attendance",
+		CanonicalAttendanceIdentity:    canonicalIdent,
+		DistinctScanDistinguishability: distinctDist,
 		ClientDeduplicationKey:         "Client-generated UUID v4 idempotency token assigned per scan attempt prior to network transmission",
 		ClockSkewMitigation:            "Server does not trust client device timestamps for canonical ordering; server commit timestamp determines official attendance, but client scan timestamp is retained in scan_events for audit verification",
-		RawEventVsCanonicalRecord:      "Raw scan attempts (including duplicates and conflicting offline scans) are appended to a raw 'scan_events' table; canonical attendance is enforced via database compound unique constraint on the 'attendance' table",
+		RawEventVsCanonicalRecord:      rawVsCanon,
 		AuditResolution:                "Conflicts and repeated scans are flagged with duplicate status in scan_events and visible in admin audit reports without violating the single attendance invariant",
-		IsDefaultRecommendation:        true,
+		IsDefaultRecommendation:        isDefault,
 		UnresolvedQuestions: []string{
-			"Confirm whether earliest real-world scan timestamp is required instead of server-commit order if network sync is delayed for extended periods",
-			"Define maximum permissible offline buffering window before cached volunteer scan tokens expire",
+			q1,
+			q2,
 		},
 	}
 }
@@ -337,20 +384,61 @@ func (e *Evaluator) evaluateDecisionTraces(req *model.NormalizedRequirements, su
 
 	// Trace 2: Database Uniqueness & Duplicate Prevention
 	if req.Invariants.PreventDuplicates {
-		traces = append(traces, model.DecisionTrace{
-			Decision: "Database Compound Unique Constraint (e.g. UNIQUE (delegate_id, session_id)) with ATOMIC ON CONFLICT Handling",
-			SupportingRequirements: []string{
+		var decisionName string
+		var supportingReqs []string
+		var evidence string
+		var altRejected string
+
+		switch req.Domain {
+		case model.DomainEventManagement:
+			decisionName = "Database Compound Unique Constraint (e.g. UNIQUE (delegate_id, session_id)) with ATOMIC ON CONFLICT Handling"
+			supportingReqs = []string{
 				"Explicit requirement to prevent duplicate attendance records across simultaneous volunteer scans",
 				"Reliable check-in under network retries and multi-device concurrency",
-			},
-			EvidenceAndProvenance: "Direct user invariant stating a delegate cannot check in multiple times for the same session",
+			}
+			evidence = "Direct user invariant stating a delegate cannot check in multiple times for the same session"
+			altRejected = "Application-level check-then-act suffers from race conditions under concurrent volunteer scans"
+		case model.DomainECommerce:
+			decisionName = "Database Unique Constraint on Order/Payment Tokens with ATOMIC ON CONFLICT Handling"
+			supportingReqs = []string{
+				"Requirement to prevent duplicate orders, double payments, and race conditions during checkout",
+				"Reliable transaction processing under network retries and client reconnections",
+			}
+			evidence = "E-Commerce domain invariant requiring idempotent order placement and duplicate charge prevention"
+			altRejected = "Application-level check-then-act suffers from race conditions under concurrent client checkouts"
+		case model.DomainFinTech:
+			decisionName = "Database Unique Constraint on Transaction Identifiers with ATOMIC ON CONFLICT Handling"
+			supportingReqs = []string{
+				"Requirement to prevent double spending and duplicate ledger postings",
+				"Strict transaction uniqueness across concurrent payment transfers and API retries",
+			}
+			evidence = "FinTech invariant enforcing absolute uniqueness on payment references and transfer IDs"
+			altRejected = "Application-level check-then-act suffers from race conditions under concurrent ledger updates"
+		default:
+			targetStr := "natural business keys"
+			if len(req.Invariants.UniquenessTargets) > 0 {
+				targetStr = strings.Join(req.Invariants.UniquenessTargets, ", ")
+			}
+			decisionName = fmt.Sprintf("Database Unique Constraint on %s with ATOMIC ON CONFLICT Handling", targetStr)
+			supportingReqs = []string{
+				"Explicit requirement to prevent duplicate entity creation and concurrent write conflicts",
+				"Reliable record insertion under concurrent client requests and network retries",
+			}
+			evidence = "User invariant requiring atomic duplicate prevention and entity uniqueness"
+			altRejected = "Application-level check-then-act suffers from race conditions under concurrent requests"
+		}
+
+		traces = append(traces, model.DecisionTrace{
+			Decision:               decisionName,
+			SupportingRequirements: supportingReqs,
+			EvidenceAndProvenance:  evidence,
 			AlternativesConsidered: []string{
 				"Application-level SELECT-then-INSERT checking",
 				"Distributed Redis Lock (Redlock)",
 				"Pessimistic Table/Row Locking",
 			},
 			RejectedReasons: []string{
-				"Application-level check-then-act suffers from race conditions under concurrent volunteer scans",
+				altRejected,
 				"Distributed locks introduce external point of failure and latency overhead",
 				"Pessimistic row locking degrades throughput unnecessarily when conflict rate is low",
 			},
@@ -363,19 +451,55 @@ func (e *Evaluator) evaluateDecisionTraces(req *model.NormalizedRequirements, su
 
 	// Trace 3: Transactional Outbox Pattern
 	if summary.RecommendedDataRules.RequiresOutboxPattern {
-		traces = append(traces, model.DecisionTrace{
-			Decision: "Transactional Outbox Pattern for Asynchronous Side Effects",
-			SupportingRequirements: []string{
+		var supportingReqs []string
+		var evidence string
+		var syncRejected string
+
+		switch req.Domain {
+		case model.DomainEventManagement:
+			supportingReqs = []string{
 				"Decoupling asynchronous tasks (certificate generation, bulk email notifications) from fast check-in responses",
 				"Dual-write safety between business record insertion and asynchronous job publishing",
-			},
-			EvidenceAndProvenance: "Requirement for quick attendance verification while certificate generation and notifications run asynchronously",
+			}
+			evidence = "Requirement for quick attendance verification while certificate generation and notifications run asynchronously"
+			syncRejected = "Synchronous PDF generation creates unacceptable latency for scanning volunteers"
+		case model.DomainECommerce:
+			supportingReqs = []string{
+				"Decoupling asynchronous fulfillment tasks (inventory notifications, confirmation emails, webhook dispatch) from checkout responses",
+				"Dual-write safety between order persistence and event publication",
+			}
+			evidence = "Requirement to guarantee eventual delivery of order events without blocking HTTP checkout transactions"
+			syncRejected = "Synchronous third-party dispatch in request path creates high tail latency and order completion failure on network hiccups"
+		case model.DomainFinTech:
+			supportingReqs = []string{
+				"Decoupling asynchronous settlement notifications, ledger exports, and webhook dispatches from transfer execution",
+				"Strict dual-write safety between atomic ledger mutation and downstream message publishing",
+			}
+			evidence = "FinTech requirement for reliable at-least-once downstream event delivery guaranteed by atomic local database commit"
+			syncRejected = "Inline synchronous dispatch to downstream partners risks timeout cascades on financial transactions"
+		default:
+			asyncDesc := "asynchronous background tasks"
+			if len(req.Invariants.AsyncOperations) > 0 {
+				asyncDesc = strings.Join(req.Invariants.AsyncOperations, ", ")
+			}
+			supportingReqs = []string{
+				fmt.Sprintf("Decoupling asynchronous tasks (%s) from fast synchronous responses", asyncDesc),
+				"Dual-write safety between business record insertion and asynchronous job publishing",
+			}
+			evidence = fmt.Sprintf("Requirement for reliable processing while %s execute asynchronously", asyncDesc)
+			syncRejected = "Synchronous inline task execution increases request latency and couples primary response to background task performance"
+		}
+
+		traces = append(traces, model.DecisionTrace{
+			Decision:               "Transactional Outbox Pattern for Asynchronous Side Effects",
+			SupportingRequirements: supportingReqs,
+			EvidenceAndProvenance:  evidence,
 			AlternativesConsidered: []string{
 				"Synchronous inline task execution",
 				"Direct message broker publish inside database transaction",
 			},
 			RejectedReasons: []string{
-				"Synchronous PDF generation creates unacceptable latency for scanning volunteers",
+				syncRejected,
 				"Direct broker publish inside DB transaction risks dual-write inconsistency and connection starvation on network delay",
 			},
 			KnownTradeoffs: []string{
@@ -389,7 +513,7 @@ func (e *Evaluator) evaluateDecisionTraces(req *model.NormalizedRequirements, su
 }
 
 // evaluateQueueRules configures bounded queues, backpressure, and dead-letter handling.
-func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class *model.ClassificationResult, dataRules model.DataRules) model.QueueRules {
+func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class *model.ClassificationResult, dataRules model.DataRules, workerConcurrency int) model.QueueRules {
 	needsQueue := dataRules.RequiresOutboxPattern ||
 		class.HasTrait(model.TraitBackgroundIntensive) ||
 		req.Domain == model.DomainECommerce ||
@@ -401,16 +525,51 @@ func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class 
 		return model.QueueRules{Enabled: false}
 	}
 
+	var providerIntegrations []model.ProviderIdempotencySpec
+	if req.Domain == model.DomainEventManagement {
+		providerIntegrations = []model.ProviderIdempotencySpec{
+			{
+				ProviderName:         "Transactional Email Service (SendGrid / SMTP)",
+				Mechanism:            "METADATA_JOB_ID_AND_WEBHOOK_RECONCILIATION",
+				TokenFormat:          "custom_args: { job_id: outbox_event_id, delegate_id: delegate_id }",
+				RetentionWindow:      "72 hours delivery event retention",
+				AmbiguousTimeoutPlan: "On transport timeout, worker queries email delivery status via event activity API using job_id before re-sending to prevent duplicate attendee emails",
+			},
+			{
+				ProviderName:         "Certificate Storage (S3 / Cloud Storage)",
+				Mechanism:            "DETERMINISTIC_BLOB_STORAGE_PATH",
+				TokenFormat:          "certificates/{conference_id}/{delegate_id}.pdf",
+				RetentionWindow:      "Indefinite durable storage",
+				AmbiguousTimeoutPlan: "Deterministic object overwrite (PutObject) is inherently idempotent; repeated uploads safely write identical certificate payload",
+			},
+		}
+	} else if req.Domain == model.DomainECommerce || req.Domain == model.DomainFinTech {
+		providerIntegrations = []model.ProviderIdempotencySpec{
+			{
+				ProviderName:         "Payment Gateway (Stripe / Processor)",
+				Mechanism:            "HEADER_IDEMPOTENCY_KEY",
+				TokenFormat:          "Idempotency-Key: outbox_event_id",
+				RetentionWindow:      "24 hours gateway idempotency retention",
+				AmbiguousTimeoutPlan: "Re-issue request with identical Idempotency-Key header; gateway replays cached transaction result without double-charging",
+			},
+		}
+	}
+
 	queue := model.QueueRules{
 		Enabled:                         true,
-		MaxWorkerConcurrency:            10,
+		MaxWorkerConcurrency:            workerConcurrency,
 		MaxRetryAttempts:                3,
 		BackoffStrategy:                 "EXPONENTIAL_WITH_JITTER",
 		DeadLetterHandling:              "Quarantine in failed_jobs table with structured error log and alert metric",
 		DeliveryGuarantee:               "AT_LEAST_ONCE (handlers must be idempotent)",
+		JobClaimMechanism:               "WITH available_jobs AS (SELECT id FROM outbox_events WHERE (status = 'PENDING') OR (status = 'IN_PROGRESS' AND lease_expires_at < NOW()) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 10) UPDATE outbox_events e SET status = 'IN_PROGRESS', claimed_by = $1, claim_token = gen_random_uuid(), lease_expires_at = NOW() + INTERVAL '60 seconds', attempt_count = attempt_count + 1, updated_at = NOW() FROM available_jobs WHERE e.id = available_jobs.id RETURNING e.id, e.task_type, e.payload, e.claim_token, e.attempt_count",
+		ClaimLeaseDuration:              "60 seconds initial lease stored in lease_expires_at; transaction commits immediately after claim update, releasing row locks before worker executes background processing",
+		LeaseRenewalPolicy:              "Workers running long tasks (> 30s) execute periodic heartbeat updates every 20s: 'UPDATE outbox_events SET lease_expires_at = NOW() + INTERVAL 60 seconds WHERE id = $1 AND claim_token = $2 AND status = IN_PROGRESS'",
+		FencingTokenMechanism:           "Completion update checks 'WHERE id = $1 AND claim_token = $2'; if 0 rows affected due to lease expiration and reclaim by another worker, the stale worker halts without overwriting newer state",
 		ExternalDispatchFailureHandling: "Worker crash after successful external dispatch prior to DB status commit is modeled as AT_LEAST_ONCE; downstream providers must support idempotency tokens or reconciliation",
 		ProviderIdempotencyStrategy:     "Dispatcher includes deterministic external idempotency key (e.g. outbox_event_id or job_id) in external third-party API calls (e.g. Stripe, SendGrid) to prevent duplicate external side-effects",
 		CrashRecoveryBehavior:           "Worker reclaims unacknowledged or timed-out in-flight jobs via SKIP LOCKED lease timeout; uncommitted external calls will be retried safely with the identical provider idempotency token",
+		ProviderIntegrations:            providerIntegrations,
 	}
 
 	// Scale-appropriate queue mechanism:
@@ -421,15 +580,13 @@ func (e *Evaluator) evaluateQueueRules(req *model.NormalizedRequirements, class 
 		queue.QueueMechanism = "REDIS_STREAMS"
 	}
 
-	if req.Traffic.PeakRPS > 500 {
-		queue.MaxWorkerConcurrency = 25
+	if workerConcurrency == 25 {
 		queue.MaxRetryAttempts = 5
 		queue.WorkerSizingRationale = "High concurrency worker pool (25 workers) sized to process heavy burst queues without accumulating lag."
-	} else if len(req.Invariants.AsyncOperations) > 0 {
-		queue.MaxWorkerConcurrency = 8
+	} else if workerConcurrency == 8 {
 		queue.WorkerSizingRationale = "Bounded concurrency (8 workers) protects CPU/memory from heavy PDF certificate generation and external email API latency, preserving capacity for HTTP handlers."
 	} else {
-		queue.WorkerSizingRationale = "Standard bounded concurrency (10 workers) ensures steady asynchronous processing without database connection starvation."
+		queue.WorkerSizingRationale = fmt.Sprintf("Standard bounded concurrency (%d workers) ensures steady asynchronous processing without database connection starvation.", workerConcurrency)
 	}
 
 	return queue
