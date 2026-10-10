@@ -115,21 +115,22 @@ func (d *GapDetector) Analyze(norm *model.NormalizedRequirements) *GapAnalysis {
 		gap := ArchitectureGap{
 			Field:             "OFFLINE_SYNC_SEMANTICS",
 			Severity:          ImpactMedium,
-			Description:       "Offline check-in during network interruptions is required, but conflict resolution rules for concurrent multi-device scans were unspecified.",
-			DefaultAssumption: "Client devices buffer scans with client-generated event UUIDs; server enforces idempotent first-write-wins via database compound unique constraint.",
+			Description:       "Offline check-in during network interruptions is required, but conflict resolution rules for concurrent multi-device scans were unspecified. Note: Server-side first-write-wins cannot guarantee the earliest real-world scan due to asynchronous upload delays and client clock skew.",
+			DefaultAssumption: "Recommended Default (provisional): Client devices buffer scans with client-generated event UUIDs; raw scan attempts are recorded in a scan_events log, while canonical attendance is committed via database compound unique constraint (server-accepted first-write-wins).",
 		}
 		analysis.Gaps = append(analysis.Gaps, gap)
 		analysis.Assumptions = append(analysis.Assumptions, gap.DefaultAssumption)
 
 		analysis.Questions = append(analysis.Questions, ClarificationQuestion{
-			Topic:    "Offline Check-in Conflict Resolution",
-			Question: "When multiple volunteer devices scan the same delegate while offline, how should conflicts be resolved upon sync?",
+			Topic:    "Offline Check-in Conflict Resolution Policy",
+			Question: "When multiple volunteer devices scan the same delegate during intermittent network connectivity, which conflict resolution policy should govern?",
 			SuggestedOptions: []string{
-				"First-write-wins: reject subsequent scans as duplicate (Recommended)",
-				"Last-write-wins: overwrite previous check-in timestamp",
-				"Audit-all: record every scan event with device metadata",
+				"1. Server-accepted first write wins: first valid check-in committed by server is canonical; duplicates recorded as audit log (Recommended Default)",
+				"2. Earliest valid scan wins: earliest client scan timestamp is preferred, subject to clock-skew tolerance and trust verification",
+				"3. Audit-all: every scan attempt is recorded in scan_events, while exactly one canonical attendance record is enforced by database constraint",
+				"4. Offline scans disabled: check-in strictly requires a live server connection",
 			},
-			AppliedDefault: "First-write-wins via unique constraint (UNIQUE(delegate_id, session_id))",
+			AppliedDefault: "Server-accepted first write wins with raw scan_events audit log (Recommended default, pending confirmation)",
 		})
 	}
 

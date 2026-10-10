@@ -20,9 +20,10 @@ const (
 type LockingStrategy string
 
 const (
-	LockingNone        LockingStrategy = "NONE"
-	LockingOptimistic  LockingStrategy = "OPTIMISTIC"  // Version/updated_at check
-	LockingPessimistic LockingStrategy = "PESSIMISTIC" // SELECT FOR UPDATE
+	LockingNone            LockingStrategy = "NONE"
+	LockingDatabaseManaged LockingStrategy = "DATABASE_MANAGED_CONFLICT" // Atomic unique indexes, INSERT ... ON CONFLICT
+	LockingOptimistic      LockingStrategy = "OPTIMISTIC"                // Version/updated_at check
+	LockingPessimistic     LockingStrategy = "PESSIMISTIC"               // SELECT FOR UPDATE
 )
 
 // SystemTopology defines high-level architecture decisions and layout.
@@ -52,6 +53,84 @@ type ComponentDefinition struct {
 	PersistenceAccess bool `json:"persistence_access"`
 }
 
+// TransactionPolicy clarifies ACID transaction requirements, per-operation boundaries, and consistency tolerances.
+type TransactionPolicy struct {
+	// RequiresACID indicates if atomic multi-step transactions are required.
+	RequiresACID bool `json:"requires_acid"`
+
+	// Scope indicates the transaction boundary ("PER_OPERATION_ATOMIC", "NONE", "GLOBAL_STRONG").
+	Scope string `json:"scope"`
+
+	// AtomicOperations lists specific business operations requiring multi-step database atomicity.
+	AtomicOperations []string `json:"atomic_operations,omitempty"`
+
+	// DatabaseEnforcedInvariants lists invariants enforced directly by database constraints (unique indexes, foreign keys).
+	DatabaseEnforcedInvariants []string `json:"database_enforced_invariants,omitempty"`
+
+	// EventualConsistencyAllowed lists asynchronous side effects and read paths that can tolerate lag.
+	EventualConsistencyAllowed []string `json:"eventual_consistency_allowed,omitempty"`
+
+	// Rationale provides architectural justification for these transaction boundaries.
+	Rationale string `json:"rationale,omitempty"`
+}
+
+// ConcurrencyControlDetails makes locking and conflict mechanics explicit.
+type ConcurrencyControlDetails struct {
+	// Mechanism describes the primary duplicate prevention and concurrency control mechanism.
+	Mechanism string `json:"mechanism"`
+
+	// ExplicitLockingRequired indicates if application-level row locks (e.g. SELECT FOR UPDATE) are needed.
+	ExplicitLockingRequired bool `json:"explicit_locking_required"`
+
+	// ConcurrentConflictBehavior explains what happens when concurrent requests write conflicting data.
+	ConcurrentConflictBehavior string `json:"concurrent_conflict_behavior"`
+
+	// IsolationLevel clarifies transaction isolation (e.g. "READ_COMMITTED").
+	IsolationLevel string `json:"isolation_level"`
+
+	// QueueWorkerClaimLocking documents how background workers safely claim jobs.
+	QueueWorkerClaimLocking string `json:"queue_worker_claim_locking,omitempty"`
+
+	// Rationale explains why this locking design was chosen over heavier alternatives.
+	Rationale string `json:"rationale,omitempty"`
+}
+
+// IdempotencyPolicy defines comprehensive request deduplication and idempotency mechanics.
+type IdempotencyPolicy struct {
+	// Required indicates if request-level idempotency enforcement is mandatory.
+	Required bool `json:"required"`
+
+	// ApplicableOperations lists specific mutating operations requiring request deduplication tokens.
+	ApplicableOperations []string `json:"applicable_operations,omitempty"`
+
+	// KeyScope defines the namespace and uniqueness boundary (e.g. "HEADER_IDEMPOTENCY_KEY_SCOPED_BY_OPERATION").
+	KeyScope string `json:"key_scope"`
+
+	// FingerprintMechanism defines how request payload tampering or reuse across different bodies is detected.
+	FingerprintMechanism string `json:"fingerprint_mechanism"`
+
+	// StateStorageMechanism defines where and how idempotency records are stored.
+	StateStorageMechanism string `json:"state_storage_mechanism"`
+
+	// ConcurrentRequestHandling defines behavior when an in-flight request arrives with the same active key.
+	ConcurrentRequestHandling string `json:"concurrent_request_handling"`
+
+	// PayloadMismatchBehavior defines behavior when a key is reused with a different request payload fingerprint.
+	PayloadMismatchBehavior string `json:"payload_mismatch_behavior"`
+
+	// ResponseReplayBehavior defines how lost-response retries are fulfilled without re-executing business logic.
+	ResponseReplayBehavior string `json:"response_replay_behavior"`
+
+	// RetentionPeriod defines time-to-live before idempotency keys expire.
+	RetentionPeriod string `json:"retention_period"`
+
+	// EnforcementValidationCriteria describes how static or runtime verification proves actual enforcement beyond header presence.
+	EnforcementValidationCriteria string `json:"enforcement_validation_criteria"`
+
+	// DatabaseUniquenessAlternative explains which operations rely directly on database unique constraints instead of idempotency tokens.
+	DatabaseUniquenessAlternative string `json:"database_uniqueness_alternative,omitempty"`
+}
+
 // DataRules governs database transaction boundaries, locking, and consistency.
 type DataRules struct {
 	// IsolationLevel recommended (e.g., "READ_COMMITTED", "REPEATABLE_READ", "SERIALIZABLE").
@@ -60,8 +139,20 @@ type DataRules struct {
 	// Locking indicates concurrency control method.
 	Locking LockingStrategy `json:"locking"`
 
+	// RequiresACID marks if atomic transactions are required.
+	RequiresACID bool `json:"requires_acid"`
+
+	// TransactionPolicy details atomic boundaries and invariant enforcement.
+	TransactionPolicy TransactionPolicy `json:"transaction_policy"`
+
+	// ConcurrencyDetails details explicit vs database-managed locking mechanics.
+	ConcurrencyDetails ConcurrencyControlDetails `json:"concurrency_details"`
+
 	// RequiresIdempotencyKey marks if mutating endpoints must require idempotency tokens.
 	RequiresIdempotencyKey bool `json:"requires_idempotency_key"`
+
+	// IdempotencyPolicy defines complete request deduplication, payload fingerprinting, and replay rules.
+	IdempotencyPolicy IdempotencyPolicy `json:"idempotency_policy"`
 
 	// RequiresOutboxPattern marks whether DB transactions writing events must use an outbox table.
 	RequiresOutboxPattern bool `json:"requires_outbox_pattern"`
@@ -104,6 +195,117 @@ type QueueRules struct {
 
 	// DeadLetterHandling describes dead-letter capture and alerting strategy.
 	DeadLetterHandling string `json:"dead_letter_handling,omitempty"`
+
+	// ExternalDispatchFailureHandling models worker crash after external call success prior to DB commit.
+	ExternalDispatchFailureHandling string `json:"external_dispatch_failure_handling,omitempty"`
+
+	// ProviderIdempotencyStrategy describes client tokens passed to external providers to prevent duplicate external side-effects.
+	ProviderIdempotencyStrategy string `json:"provider_idempotency_strategy,omitempty"`
+
+	// CrashRecoveryBehavior details how worker restart safely picks up pending or in-flight events.
+	CrashRecoveryBehavior string `json:"crash_recovery_behavior,omitempty"`
+}
+
+// CapacityPlan documents connection pool and worker sizing derivations using Little's Law.
+type CapacityPlan struct {
+	// QuantityBeingEstimated states the specific quantity modeled (e.g. "Concurrent Active Database Transactions").
+	QuantityBeingEstimated string `json:"quantity_being_estimated"`
+
+	// SelectedScenario names the specific traffic scenario modeled (e.g. "Conservative Peak Burst Scenario").
+	SelectedScenario string `json:"selected_scenario"`
+
+	// ScenarioRationale explains why this scenario was selected from the planning traffic range.
+	ScenarioRationale string `json:"scenario_rationale"`
+
+	// EstimatedArrivalRateRange notes the derived planning arrival range (e.g. "15.0 - 25.0 HTTP RPS").
+	EstimatedArrivalRateRange string `json:"estimated_arrival_rate_range"`
+
+	// PlanningArrivalRate notes the single arrival rate lambda used for sizing calculations.
+	PlanningArrivalRate float64 `json:"planning_arrival_rate"`
+
+	// LittlesLawFormula shows the formula applied (L = lambda * W).
+	LittlesLawFormula string `json:"littles_law_formula"`
+
+	// EstimatedServiceTime notes the average duration W per query or transaction.
+	EstimatedServiceTime string `json:"estimated_service_time"`
+
+	// EstimatedAverageConcurrency notes the derived average concurrent load L.
+	EstimatedAverageConcurrency float64 `json:"estimated_average_concurrency"`
+
+	// RecommendedDBPoolMax is the safe maximum database connection pool size.
+	RecommendedDBPoolMax int `json:"recommended_db_pool_max"`
+
+	// WorkerConcurrencyMax is the bounded number of background workers.
+	WorkerConcurrencyMax int `json:"worker_concurrency_max"`
+
+	// HeadroomRationale explains burst protection without claiming unverified capacity guarantees.
+	HeadroomRationale string `json:"headroom_rationale"`
+
+	// CapacityCaveats lists assumptions, limitations, and recommendation for empirical load testing.
+	CapacityCaveats []string `json:"capacity_caveats"`
+}
+
+// OfflineSyncStrategy defines offline check-in buffering, synchronization, and conflict resolution semantics.
+type OfflineSyncStrategy struct {
+	// Policy is the chosen or proposed conflict resolution policy.
+	Policy string `json:"policy"`
+
+	// ScanEventIdentity defines the stable client UUID assigned per physical scan event.
+	ScanEventIdentity string `json:"scan_event_identity"`
+
+	// RequestTransportIdempotency defines the HTTP transport retry key protecting batch uploads.
+	RequestTransportIdempotency string `json:"request_transport_idempotency"`
+
+	// CanonicalAttendanceIdentity defines database-enforced attendance identity.
+	CanonicalAttendanceIdentity string `json:"canonical_attendance_identity"`
+
+	// DistinctScanDistinguishability defines how repeated physical scans remain distinguishable from transport retries.
+	DistinctScanDistinguishability string `json:"distinct_scan_distinguishability"`
+
+	// ClientDeduplicationKey describes client-side deduplication key format.
+	ClientDeduplicationKey string `json:"client_deduplication_key"`
+
+	// ClockSkewMitigation explains handling of client clock drift, tampering, and replay.
+	ClockSkewMitigation string `json:"clock_skew_mitigation"`
+
+	// RawEventVsCanonicalRecord documents separation of raw scan attempts from canonical attendance records.
+	RawEventVsCanonicalRecord string `json:"raw_event_vs_canonical_record"`
+
+	// AuditResolution explains how conflicts and duplicate scans are recorded for administrative auditing.
+	AuditResolution string `json:"audit_resolution"`
+
+	// IsDefaultRecommendation indicates whether this is an applied default rather than an explicit user decision.
+	IsDefaultRecommendation bool `json:"is_default_recommendation"`
+
+	// UnresolvedQuestions lists gaps or questions if the policy is provisional.
+	UnresolvedQuestions []string `json:"unresolved_questions,omitempty"`
+}
+
+// DecisionTrace provides end-to-end traceability from requirements to an architectural decision.
+type DecisionTrace struct {
+	// Decision is the architectural choice (e.g. "PostgreSQL Compound Unique Index for Attendance").
+	Decision string `json:"decision"`
+
+	// SupportingRequirements lists prompt requirements and domain invariants justifying the decision.
+	SupportingRequirements []string `json:"supporting_requirements"`
+
+	// EvidenceAndProvenance states the source and certainty of supporting evidence.
+	EvidenceAndProvenance string `json:"evidence_and_provenance"`
+
+	// AlternativesConsidered lists discarded alternative patterns.
+	AlternativesConsidered []string `json:"alternatives_considered"`
+
+	// RejectedReasons explains why alternatives were not selected.
+	RejectedReasons []string `json:"rejected_reasons"`
+
+	// Assumptions notes any provisional assumptions made.
+	Assumptions []string `json:"assumptions,omitempty"`
+
+	// KnownTradeoffs highlights trade-offs accepted by this decision.
+	KnownTradeoffs []string `json:"known_tradeoffs"`
+
+	// Confidence expresses certainty between 0.0 and 1.0.
+	Confidence float64 `json:"confidence"`
 }
 
 // ImplementationConstraint gives concrete instructions that the AI coding agent must obey.
@@ -162,6 +364,12 @@ type ArchitectureContract struct {
 	// Queue defines background job and worker rules.
 	Queue QueueRules `json:"queue"`
 
+	// CapacityPlan details connection pool sizing and concurrency limits.
+	CapacityPlan CapacityPlan `json:"capacity_plan"`
+
+	// OfflineSync details offline synchronization semantics when offline capability is active.
+	OfflineSync *OfflineSyncStrategy `json:"offline_sync,omitempty"`
+
 	// Constraints lists concrete DOs and DONTs for the coding agent.
 	Constraints []ImplementationConstraint `json:"constraints"`
 
@@ -170,6 +378,12 @@ type ArchitectureContract struct {
 
 	// ValidationCriteria describes how to verify the generated implementation.
 	ValidationCriteria []ValidationCriterion `json:"validation_criteria"`
+
+	// DecisionTraces connects major architectural decisions to explicit requirements and evidence.
+	DecisionTraces []DecisionTrace `json:"decision_traces,omitempty"`
+
+	// FieldProvenance maps numeric and architectural parameters to their provenance.
+	FieldProvenance map[string]ProvenanceMeta `json:"field_provenance,omitempty"`
 
 	// ActiveAssumptions notes non-blocking assumptions the agent must keep in mind.
 	ActiveAssumptions []string `json:"active_assumptions"`
@@ -248,6 +462,86 @@ func (c *ArchitectureContract) ValidateConsistency() error {
 		}
 		if !hasUniqueConstraint {
 			return errors.New("contract contradiction: data.uniqueness_strategy is defined but no uniqueness constraint is included")
+		}
+	}
+
+	// 5. ACID outbox consistency:
+	// Transactional outbox requires atomic database transaction capability.
+	if c.Data.RequiresOutboxPattern {
+		if !c.Data.RequiresACID && !c.Data.TransactionPolicy.RequiresACID {
+			return errors.New("contract contradiction: data.requires_outbox_pattern is true but data.requires_acid is false (outbox requires atomic multi-step database transactions)")
+		}
+	}
+
+	// 6. At-least-once delivery requires idempotency or deduplication
+	if c.Queue.Enabled && strings.Contains(strings.ToUpper(c.Queue.DeliveryGuarantee), "AT_LEAST_ONCE") {
+		hasIdempOrDedup := strings.Contains(strings.ToLower(c.Queue.DeliveryGuarantee), "idempotent")
+		for _, rule := range c.Constraints {
+			if strings.Contains(strings.ToLower(rule.Rule), "idempotent") || strings.Contains(strings.ToLower(rule.Rule), "deduplication") {
+				hasIdempOrDedup = true
+				break
+			}
+		}
+		if !hasIdempOrDedup {
+			return errors.New("contract contradiction: queue delivery guarantee is AT_LEAST_ONCE but no worker idempotency or deduplication strategy is documented")
+		}
+	}
+
+	// 7. Queue retry without dead-letter handling or retry limit
+	if c.Queue.Enabled && c.Queue.MaxRetryAttempts > 0 && strings.TrimSpace(c.Queue.DeadLetterHandling) == "" {
+		return errors.New("contract contradiction: queue retries are enabled but queue.dead_letter_handling is undefined")
+	}
+
+	// 8. Bounded concurrency enforcement
+	if c.Queue.Enabled && c.Queue.MaxWorkerConcurrency <= 0 {
+		return errors.New("contract contradiction: queue is enabled but queue.max_worker_concurrency is not bounded (must be > 0)")
+	}
+
+	// 9. External calls prohibited in transactions while execution plan requires them inside tx
+	hasProhibition := false
+	for _, rule := range c.Constraints {
+		if strings.Contains(strings.ToLower(rule.Rule), "external") && strings.Contains(strings.ToLower(rule.Rule), "inside an active database transaction") {
+			hasProhibition = true
+			break
+		}
+	}
+	if hasProhibition {
+		for _, comp := range c.Components {
+			for _, resp := range comp.Responsibilities {
+				respLower := strings.ToLower(resp)
+				if (strings.Contains(respLower, "external payment") || strings.Contains(respLower, "third-party api") || strings.Contains(respLower, "webhook")) &&
+					(strings.Contains(respLower, "inside transaction") || strings.Contains(respLower, "inside db tx")) {
+					return fmt.Errorf("contract contradiction: component %q responsibility %q places external network call inside DB transaction, violating constraint", comp.Name, resp)
+				}
+			}
+		}
+	}
+
+	// 10. Offline handling required while contract has no synchronization or conflict policy
+	for _, comp := range c.Components {
+		for _, resp := range comp.Responsibilities {
+			if strings.Contains(strings.ToLower(resp), "offline") {
+				if c.OfflineSync == nil || c.OfflineSync.Policy == "" {
+					return fmt.Errorf("contract contradiction: component %q supports offline check-in but contract.offline_sync policy is missing", comp.Name)
+				}
+			}
+		}
+	}
+
+	// 11. Provenance consistency: System and assumed defaults must not silently become hard constraints
+	for field, meta := range c.FieldProvenance {
+		if (meta.Source == ProvenanceAssumedDefault || meta.Source == ProvenanceSystemDefault) && meta.IsHardConstraint {
+			return fmt.Errorf("contract contradiction: field %q has provenance %q but is marked as an immutable hard constraint without user justification", field, meta.Source)
+		}
+	}
+
+	// 12. Idempotency policy coherence
+	if c.Data.RequiresIdempotencyKey && c.Data.IdempotencyPolicy.Required {
+		if c.Data.IdempotencyPolicy.FingerprintMechanism == "" {
+			return errors.New("contract contradiction: idempotency is required but idempotency_policy.fingerprint_mechanism is missing")
+		}
+		if c.Data.IdempotencyPolicy.StateStorageMechanism == "" {
+			return errors.New("contract contradiction: idempotency is required but idempotency_policy.state_storage_mechanism is missing")
 		}
 	}
 

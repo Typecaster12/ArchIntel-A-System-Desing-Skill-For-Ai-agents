@@ -42,12 +42,12 @@ func TestContractGenerationSuccess(t *testing.T) {
 			ConnectionPoolMax:      35,
 		},
 		RecommendedQueueRules: model.QueueRules{
-			Enabled:               true,
-			QueueMechanism:        "POSTGRES_SKIP_LOCKED",
+			Enabled:              true,
+			QueueMechanism:       "POSTGRES_SKIP_LOCKED",
 			MaxWorkerConcurrency: 10,
-			MaxRetryAttempts:      3,
-			BackoffStrategy:       "EXPONENTIAL_WITH_JITTER",
-			DeadLetterHandling:    "Quarantine in failed_jobs table",
+			MaxRetryAttempts:     3,
+			BackoffStrategy:      "EXPONENTIAL_WITH_JITTER",
+			DeadLetterHandling:   "Quarantine in failed_jobs table",
 		},
 	}
 

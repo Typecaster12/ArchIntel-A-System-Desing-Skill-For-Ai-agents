@@ -88,6 +88,65 @@ The initial team is small, the project has a limited infrastructure budget, and 
 		t.Errorf("expected offline/retry notice in active assumptions")
 	}
 
+	// Verify ProjectName is domain-aware (not generic SystemDesignTarget)
+	if contract.ProjectName == "SystemDesignTarget" {
+		t.Errorf("expected domain-aware project name, got %q", contract.ProjectName)
+	}
+
+	// Verify ACID transaction consistency: requires_acid must be TRUE
+	if !contract.Data.RequiresACID {
+		t.Errorf("expected Data.RequiresACID to be true for duplicate prevention and outbox operations")
+	}
+	if !contract.Data.TransactionPolicy.RequiresACID {
+		t.Errorf("expected TransactionPolicy.RequiresACID to be true")
+	}
+	if contract.Data.TransactionPolicy.Scope != "PER_OPERATION_ATOMIC" {
+		t.Errorf("expected TransactionPolicy.Scope PER_OPERATION_ATOMIC, got %q", contract.Data.TransactionPolicy.Scope)
+	}
+
+	// Verify Concurrency Details: database unique constraint without explicit application locking
+	if contract.Data.ConcurrencyDetails.ExplicitLockingRequired {
+		t.Errorf("expected ExplicitLockingRequired to be false (PostgreSQL unique indexes handle conflict)")
+	}
+	if !strings.Contains(contract.Data.ConcurrencyDetails.Mechanism, "UNIQUE") {
+		t.Errorf("expected ConcurrencyDetails.Mechanism to mention unique constraint, got %q", contract.Data.ConcurrencyDetails.Mechanism)
+	}
+
+	// Verify Capacity Plan via Little's Law
+	if contract.CapacityPlan.RecommendedDBPoolMax <= 0 {
+		t.Errorf("expected positive RecommendedDBPoolMax, got %d", contract.CapacityPlan.RecommendedDBPoolMax)
+	}
+	if !strings.Contains(contract.CapacityPlan.LittlesLawFormula, "L = lambda * W") {
+		t.Errorf("expected Little's Law formula in capacity plan, got %q", contract.CapacityPlan.LittlesLawFormula)
+	}
+
+	// Verify Offline Synchronization strategy is defined
+	if contract.OfflineSync == nil {
+		t.Fatalf("expected contract.OfflineSync to be non-nil for offline-capable workload")
+	}
+	if contract.OfflineSync.Policy != "SERVER_FIRST_WRITE_WINS_WITH_AUDIT_LOG" {
+		t.Errorf("expected SERVER_FIRST_WRITE_WINS_WITH_AUDIT_LOG, got %q", contract.OfflineSync.Policy)
+	}
+	if !contract.OfflineSync.IsDefaultRecommendation {
+		t.Errorf("expected OfflineSync to be labeled as a recommendation, not a user decision")
+	}
+
+	// Verify Decision Traces are populated
+	if len(contract.DecisionTraces) < 3 {
+		t.Errorf("expected at least 3 decision traces, got %d", len(contract.DecisionTraces))
+	}
+
+	// Verify Field Provenance distinguishes user provided from derived
+	if len(contract.FieldProvenance) == 0 {
+		t.Errorf("expected FieldProvenance to be populated")
+	}
+	if contract.FieldProvenance["data.requires_acid"].Source != model.ProvenanceDerived {
+		t.Errorf("expected data.requires_acid provenance DERIVED, got %v", contract.FieldProvenance["data.requires_acid"].Source)
+	}
+	if contract.FieldProvenance["traffic.expected_rps"].Source != model.ProvenanceDerived {
+		t.Errorf("expected traffic.expected_rps provenance DERIVED, got %v", contract.FieldProvenance["traffic.expected_rps"].Source)
+	}
+
 	// Verify Microservices and dedicated brokers were rejected
 	foundMicroReject := false
 	foundBrokerReject := false

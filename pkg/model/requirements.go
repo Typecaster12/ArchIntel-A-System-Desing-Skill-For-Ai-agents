@@ -16,14 +16,15 @@ const (
 type DomainCategory string
 
 const (
-	DomainGeneralCRUD   DomainCategory = "CRUD"
-	DomainECommerce     DomainCategory = "ECOMMERCE"
-	DomainFinTech       DomainCategory = "FINTECH"
-	DomainIoTTelemetry  DomainCategory = "IOT_TELEMETRY"
-	DomainRealtimeChat  DomainCategory = "REALTIME_CHAT"
-	DomainAnalytics     DomainCategory = "ANALYTICS"
-	DomainContentMedia  DomainCategory = "CONTENT_MEDIA"
-	DomainAsyncPipeline DomainCategory = "ASYNC_PIPELINE"
+	DomainGeneralCRUD     DomainCategory = "CRUD"
+	DomainECommerce       DomainCategory = "ECOMMERCE"
+	DomainFinTech         DomainCategory = "FINTECH"
+	DomainIoTTelemetry    DomainCategory = "IOT_TELEMETRY"
+	DomainRealtimeChat    DomainCategory = "REALTIME_CHAT"
+	DomainAnalytics       DomainCategory = "ANALYTICS"
+	DomainContentMedia    DomainCategory = "CONTENT_MEDIA"
+	DomainAsyncPipeline   DomainCategory = "ASYNC_PIPELINE"
+	DomainEventManagement DomainCategory = "EVENT_MANAGEMENT"
 )
 
 // RawRequirement is the raw payload submitted by the AI agent or developer.
@@ -70,6 +71,12 @@ type TrafficProfile struct {
 	// PeakArrivalWindow is the arrival window text if specified (e.g. "300-500 attendees in 30 minutes").
 	PeakArrivalWindow string `json:"peak_arrival_window,omitempty"`
 
+	// ArrivalsPerSec is the physical arrival rate calculated from the arrival window (not HTTP RPS).
+	ArrivalsPerSec float64 `json:"arrivals_per_sec,omitempty"`
+
+	// EstimatedHTTPRPS is the planning estimate for peak HTTP traffic (including retries, scans, dashboard).
+	EstimatedHTTPRPS float64 `json:"estimated_http_rps,omitempty"`
+
 	// DerivedRPSReason explains how RPS was calculated from stated figures or defaults.
 	DerivedRPSReason string `json:"derived_rps_reason,omitempty"`
 
@@ -85,8 +92,14 @@ type DataProfile struct {
 	// DailyVolumeMB is the estimated incoming data volume per day in megabytes.
 	DailyVolumeMB float64 `json:"daily_volume_mb"`
 
-	// RequiresACID indicates if strict multi-row transaction isolation is mandatory.
+	// RequiresACID indicates if atomic transactions are mandatory (e.g. multi-step writes or outbox).
 	RequiresACID bool `json:"requires_acid"`
+
+	// TransactionScope clarifies the required transaction boundaries (e.g. "PER_OPERATION_ATOMIC", "NONE").
+	TransactionScope string `json:"transaction_scope,omitempty"`
+
+	// AtomicOutboxRequired indicates if state updates and outbox events must be written atomically.
+	AtomicOutboxRequired bool `json:"atomic_outbox_required,omitempty"`
 
 	// HasHighContention indicates whether multiple concurrent requests mutate the same rows (e.g. inventory).
 	HasHighContention bool `json:"has_high_contention"`
@@ -148,6 +161,9 @@ type BusinessInvariants struct {
 	// RequiresOfflineHandling is true if client operations must buffer locally and sync later.
 	RequiresOfflineHandling bool `json:"requires_offline_handling"`
 
+	// OfflineConflictPolicy represents the chosen or proposed conflict resolution policy.
+	OfflineConflictPolicy string `json:"offline_conflict_policy,omitempty"`
+
 	// ExternalCallsInTxProhibited is true if network calls must not block DB transactions.
 	ExternalCallsInTxProhibited bool `json:"external_calls_in_tx_prohibited"`
 
@@ -156,7 +172,7 @@ type BusinessInvariants struct {
 }
 
 // NormalizedRequirements is the canonical internal representation of project requirements.
-// It explicitly distinguishes stated facts from inferred traits and default assumptions.
+// It explicitly distinguishes stated facts from inferred traits, derivations, and default assumptions.
 type NormalizedRequirements struct {
 	// ProjectName is a normalized identifier for the project.
 	ProjectName string `json:"project_name"`
@@ -187,6 +203,9 @@ type NormalizedRequirements struct {
 
 	// InferredTraits lists traits derived automatically from the prompt.
 	InferredTraits []InferredTrait `json:"inferred_traits"`
+
+	// FieldProvenance maps requirement fields to their explicit provenance (USER_PROVIDED, DERIVED, etc.).
+	FieldProvenance map[string]ProvenanceMeta `json:"field_provenance,omitempty"`
 
 	// Assumptions lists fallback assumptions made when the user prompt lacked specific data.
 	Assumptions []string `json:"assumptions"`

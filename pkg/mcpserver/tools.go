@@ -11,7 +11,7 @@ type ToolDefinition struct {
 func GetToolDefinitions() []ToolDefinition {
 	return []ToolDefinition{
 		{
-			Name: "analyze_requirements",
+			Name:        "analyze_requirements",
 			Description: "Analyzes raw requirements, normalizes traffic/scale figures, and identifies critical unstated assumptions.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
@@ -29,7 +29,7 @@ func GetToolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name: "classify_workload",
+			Name:        "classify_workload",
 			Description: "Evaluates multi-label workload traits (TransactionHeavy, ReadHeavy, WriteHeavy, LatencySensitive, etc.) with calibrated confidence scores.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
@@ -43,7 +43,7 @@ func GetToolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name: "recommend_architecture",
+			Name:        "recommend_architecture",
 			Description: "Executes full architectural decision pipeline and returns the schema-validated ArchitectureContract with component boundaries, transaction rules, queue configurations, and concrete constraints.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
@@ -68,7 +68,7 @@ func GetToolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name: "evaluate_tradeoffs",
+			Name:        "evaluate_tradeoffs",
 			Description: "Compares candidate architectural patterns and generates explicit justifications for why specific alternatives were rejected.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
@@ -82,7 +82,7 @@ func GetToolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name: "validate_architecture",
+			Name:        "validate_architecture",
 			Description: "Validates agent-proposed code files, directory structures, or design choices against the active ArchitectureContract.",
 			InputSchema: map[string]interface{}{
 				"type": "object",

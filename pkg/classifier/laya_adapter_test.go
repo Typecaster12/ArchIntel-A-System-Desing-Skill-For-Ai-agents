@@ -72,9 +72,9 @@ func TestLayaAdapterSuccessAndMalformed(t *testing.T) {
 			ModelVersion: "laya-v1-modernbert-checkpoint",
 			LatencyMs:    32,
 			Probabilities: map[string]float64{
-				string(model.TraitTransactionHeavy):      0.96,
+				string(model.TraitTransactionHeavy):     0.96,
 				string(model.TraitConsistencySensitive): 0.91,
-				string(model.TraitReadHeavy):             0.20,
+				string(model.TraitReadHeavy):            0.20,
 			},
 		}
 

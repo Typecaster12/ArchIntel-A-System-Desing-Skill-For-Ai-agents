@@ -10,6 +10,13 @@ import (
 	"github.com/sdskill/archintel/pkg/model"
 )
 
+// StaticAnalysisLimitations documents known boundaries of static AST and lexical inspection:
+// 1. Lexical and AST checks inspect syntactic patterns (e.g. calls to http.Get inside functions with tx.Begin).
+//    They cannot observe runtime execution order across asynchronous goroutines, dynamic interfaces, or reflection.
+// 2. Static analysis cannot evaluate runtime database transaction isolation, dynamic lock timeouts, or network latency.
+// 3. Static checks verify structural presence of idempotency stores and unique constraints, but cannot verify
+//    runtime data consistency without empirical database integration and concurrency tests.
+
 // Validator evaluates an implementation proposal or code snippets against an ArchitectureContract.
 type Validator struct{}
 
@@ -60,9 +67,9 @@ func (v *Validator) checkDeclaredFlags(contract *model.ArchitectureContract, pro
 	// Idempotency requirement check
 	if contract.Data.RequiresIdempotencyKey && proposal.HasIdempotencyCheck != nil && !*proposal.HasIdempotencyCheck {
 		report.Violations = append(report.Violations, Violation{
-			RuleID:   "VIOL-MISSING-IDEMPOTENCY",
-			Severity: SeverityError,
-			Message:  "The contract mandates idempotency keys on mutating routes, but the proposal omits idempotency checking.",
+			RuleID:      "VIOL-MISSING-IDEMPOTENCY",
+			Severity:    SeverityError,
+			Message:     "The contract mandates idempotency keys on mutating routes, but the proposal omits idempotency checking.",
 			Remediation: "Implement an Idempotency-Key validation middleware checking request tokens against a dedicated idempotency table.",
 		})
 	}
@@ -70,9 +77,9 @@ func (v *Validator) checkDeclaredFlags(contract *model.ArchitectureContract, pro
 	// Transactional Outbox requirement check
 	if contract.Data.RequiresOutboxPattern && proposal.UsesTransactionalOutbox != nil && !*proposal.UsesTransactionalOutbox {
 		report.Violations = append(report.Violations, Violation{
-			RuleID:   "VIOL-MISSING-OUTBOX",
-			Severity: SeverityError,
-			Message:  "The contract requires a Transactional Outbox pattern to prevent dual-write inconsistencies, but it was omitted.",
+			RuleID:      "VIOL-MISSING-OUTBOX",
+			Severity:    SeverityError,
+			Message:     "The contract requires a Transactional Outbox pattern to prevent dual-write inconsistencies, but it was omitted.",
 			Remediation: "Record outbound events in an 'outbox_events' table within the same DB transaction as business mutations, and dispatch via a worker.",
 		})
 	}
@@ -80,9 +87,9 @@ func (v *Validator) checkDeclaredFlags(contract *model.ArchitectureContract, pro
 	// Bounded worker requirement check
 	if contract.Queue.Enabled && proposal.HasBoundedWorkers != nil && !*proposal.HasBoundedWorkers {
 		report.Violations = append(report.Violations, Violation{
-			RuleID:   "VIOL-UNBOUNDED-WORKERS",
-			Severity: SeverityError,
-			Message:  "The contract requires bounded worker concurrency, but the proposal uses unbounded worker dispatching.",
+			RuleID:      "VIOL-UNBOUNDED-WORKERS",
+			Severity:    SeverityError,
+			Message:     "The contract requires bounded worker concurrency, but the proposal uses unbounded worker dispatching.",
 			Remediation: "Enforce a worker pool or channel semaphore with max concurrency (e.g. max 10-25 workers) and backpressure.",
 		})
 	}
@@ -97,7 +104,7 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 	v.inspectGoAST(file, report)
 
 	// Check 1: Synchronous external HTTP inside active DB transaction
-	if (strings.Contains(lowerContent, "tx.begin") || strings.Contains(lowerContent, "begintx")) &&
+	if (strings.Contains(lowerContent, "tx.begin") || strings.Contains(lowerContent, "begintx") || strings.Contains(lowerContent, "db.begin") || strings.Contains(lowerContent, ".begin()")) &&
 		(strings.Contains(lowerContent, "http.get") || strings.Contains(lowerContent, "http.post") || strings.Contains(lowerContent, "client.do")) {
 		report.Violations = append(report.Violations, Violation{
 			RuleID:      "VIOL-SYNC-HTTP-IN-TX",
@@ -160,17 +167,46 @@ func (v *Validator) inspectFile(contract *model.ArchitectureContract, file CodeF
 		}
 	}
 
-	// Check 6: Missing Idempotency Key validation in mutating handler
+	// Check 6: Missing or Shallow Idempotency Key validation in mutating handler
 	if contract.Data.RequiresIdempotencyKey && (strings.Contains(lowerPath, "handler") || strings.Contains(lowerPath, "controller")) {
-		if (strings.Contains(lowerContent, "checkin") || strings.Contains(lowerContent, "checkout") || strings.Contains(lowerContent, "register")) &&
-			!strings.Contains(lowerContent, "idempotency") && !strings.Contains(lowerContent, "x-idempotency") {
-			report.Violations = append(report.Violations, Violation{
-				RuleID:      "VIOL-MISSING-HANDLER-IDEMPOTENCY",
-				Severity:    SeverityWarning,
-				File:        file.Path,
-				Message:     "Mutating handler route does not extract or validate 'Idempotency-Key' header.",
-				Remediation: "Inspect 'Idempotency-Key' request header and verify against processed request store before executing mutations.",
-			})
+		isMutating := strings.Contains(lowerContent, "checkin") ||
+			strings.Contains(lowerContent, "checkout") ||
+			strings.Contains(lowerContent, "register") ||
+			strings.Contains(lowerContent, "payment") ||
+			strings.Contains(lowerContent, "order")
+
+		if isMutating {
+			hasHeader := strings.Contains(lowerContent, "header.get(\"idempotency") ||
+				strings.Contains(lowerContent, "header.get(\"x-idempotency") ||
+				strings.Contains(lowerContent, "\"idempotency-key\"") ||
+				strings.Contains(lowerContent, "\"x-idempotency-key\"") ||
+				strings.Contains(lowerContent, "idempotency-key")
+
+			hasStoreOrFingerprint := strings.Contains(lowerContent, "store") ||
+				strings.Contains(lowerContent, "fingerprint") ||
+				strings.Contains(lowerContent, "sha256") ||
+				strings.Contains(lowerContent, "replay") ||
+				strings.Contains(lowerContent, "repo") ||
+				strings.Contains(lowerContent, "cached") ||
+				strings.Contains(lowerContent, "idempotency_keys")
+
+			if !hasHeader {
+				report.Violations = append(report.Violations, Violation{
+					RuleID:      "VIOL-MISSING-HANDLER-IDEMPOTENCY",
+					Severity:    SeverityWarning,
+					File:        file.Path,
+					Message:     "Mutating handler route does not extract or validate 'Idempotency-Key' header.",
+					Remediation: "Inspect 'Idempotency-Key' request header and verify against processed request store before executing mutations.",
+				})
+			} else if !hasStoreOrFingerprint {
+				report.Violations = append(report.Violations, Violation{
+					RuleID:      "VIOL-SHALLOW-IDEMPOTENCY-CHECK",
+					Severity:    SeverityWarning,
+					File:        file.Path,
+					Message:     "Mutating handler checks for Idempotency-Key header but lacks verification against a persistent store or payload fingerprint. Checking for header presence alone is insufficient.",
+					Remediation: "Persist idempotency keys with payload SHA-256 fingerprint, lock concurrent requests (HTTP 409), and replay cached responses.",
+				})
+			}
 		}
 	}
 }

@@ -30,6 +30,7 @@ var (
 	analyticsKeywords = []string{"analytics", "reporting", "dashboard", "bi", "data warehouse", "olap", "etl"}
 	contentKeywords   = []string{"blog", "cms", "media", "video", "catalog", "article", "news", "stream", "url shortener"}
 	pipelineKeywords  = []string{"pipeline", "worker", "batch", "notification", "dispatcher", "background job"}
+	eventKeywords     = []string{"conference", "symposium", "summit", "event management", "convention", "delegate", "session", "attendance", "check-in", "qr-code"}
 )
 
 // Normalizer parses unstructured requirements and optional structured flags into NormalizedRequirements.
@@ -43,17 +44,19 @@ func New() *Normalizer {
 // Normalize processes a RawRequirement and converts it into a canonical NormalizedRequirements struct.
 func (n *Normalizer) Normalize(raw model.RawRequirement) *model.NormalizedRequirements {
 	promptLower := strings.ToLower(raw.Prompt)
+	inv := normalizeInvariants(raw, promptLower)
+	data := normalizeData(raw, promptLower, inv)
 
 	norm := &model.NormalizedRequirements{
 		ProjectName: extractProjectName(raw),
 		Summary:     generateSummary(raw.Prompt),
 		Domain:      detectDomain(raw, promptLower),
 		Traffic:     normalizeTraffic(raw, promptLower),
-		Data:        normalizeData(raw, promptLower),
+		Data:        data,
 		Latency:     normalizeLatency(raw, promptLower),
 		Consistency: detectConsistency(raw, promptLower),
 		Constraints: normalizeConstraints(raw, promptLower),
-		Invariants:  normalizeInvariants(raw, promptLower),
+		Invariants:  inv,
 		Assumptions: []string{},
 	}
 
@@ -90,14 +93,43 @@ func (n *Normalizer) Normalize(raw model.RawRequirement) *model.NormalizedRequir
 			"Idempotency validation required on mutating check-in/payment endpoints to support safe client retries across network drops")
 	}
 
+	// Populate explicit provenance for numeric and architectural values
+	norm.FieldProvenance = buildFieldProvenance(norm, promptLower)
+
 	return norm
 }
 
-// extractProjectName generates a slug or name based on hints or prompt keywords.
+// extractProjectName generates a domain-aware slug or name based on prompt phrasing or hints.
 func extractProjectName(raw model.RawRequirement) string {
 	if raw.DomainHint != "" {
 		return strings.ReplaceAll(strings.Title(strings.ToLower(raw.DomainHint)), " ", "") + "Service"
 	}
+
+	prompt := raw.Prompt
+	buildRe := regexp.MustCompile(`(?i)(?:build|design|create|develop)\s+(?:a|an)\s+(?:web-based\s+)?([A-Za-z0-9\s-]+?)(?:\s+for|\s+with|\s+that|\s+handling|\.|\n|$)`)
+	if m := buildRe.FindStringSubmatch(prompt); len(m) > 1 {
+		candidate := strings.TrimSpace(m[1])
+		words := strings.Fields(candidate)
+		if len(words) >= 1 && len(words) <= 6 {
+			var sb strings.Builder
+			for _, w := range words {
+				clean := strings.Map(func(r rune) rune {
+					if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+						return r
+					}
+					return -1
+				}, w)
+				if len(clean) > 0 {
+					sb.WriteString(strings.ToUpper(clean[:1]) + strings.ToLower(clean[1:]))
+				}
+			}
+			res := sb.String()
+			if len(res) > 3 {
+				return res
+			}
+		}
+	}
+
 	return "SystemDesignTarget"
 }
 
@@ -130,6 +162,8 @@ func detectDomain(raw model.RawRequirement, promptLower string) model.DomainCate
 			return model.DomainRealtimeChat
 		case "ASYNC_PIPELINE", "PIPELINE", "WORKER", "NOTIFICATION":
 			return model.DomainAsyncPipeline
+		case "EVENT_MANAGEMENT", "CONFERENCE":
+			return model.DomainEventManagement
 		}
 	}
 
@@ -138,6 +172,9 @@ func detectDomain(raw model.RawRequirement, promptLower string) model.DomainCate
 	}
 	if containsAny(promptLower, eCommerceKeywords) {
 		return model.DomainECommerce
+	}
+	if containsAny(promptLower, eventKeywords) {
+		return model.DomainEventManagement
 	}
 	if containsAny(promptLower, telemetryKeywords) {
 		return model.DomainIoTTelemetry
@@ -213,12 +250,14 @@ func normalizeTraffic(raw model.RawRequirement, promptLower string) model.Traffi
 		if err1 == nil && minArr > 0 {
 			avgArrivalsPerSec := ((minArr + maxArr) / 2.0) / (mins * 60.0)
 			profile.PeakArrivalWindow = arrMatch[0]
+			profile.ArrivalsPerSec = avgArrivalsPerSec
 			profile.ExpectedRPS = 2.0
 			profile.PeakRPS = 15.0 // Estimated peak HTTP RPS for simultaneous QR scans, retries, and dashboard loads
+			profile.EstimatedHTTPRPS = 15.0
 			profile.IsExplicit = true
 			profile.TrafficSource = "DERIVED_FROM_ARRIVALS"
 			profile.DerivedRPSReason = fmt.Sprintf(
-				"Derived from stated arrival volume (%s): avg %0.2f arrivals/sec, estimated peak 15-25 HTTP RPS for concurrent volunteer scans, retries, and dashboard reporting",
+				"Physical arrival rate derived from %s (%0.2f arrivals/sec). Estimated peak HTTP traffic is 15-25 RPS to account for concurrent volunteer QR scans, device retries, schedule queries, and administrative dashboard refreshes.",
 				arrMatch[0], avgArrivalsPerSec,
 			)
 		}
@@ -281,6 +320,7 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 		UniquenessTargets:           make([]string, 0),
 		RequiresIdempotency:         false,
 		RequiresOfflineHandling:     false,
+		OfflineConflictPolicy:       "",
 		ExternalCallsInTxProhibited: true,
 		AsyncOperations:             make([]string, 0),
 	}
@@ -323,6 +363,7 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 		strings.Contains(promptLower, "temporary network interruption") ||
 		strings.Contains(promptLower, "network interruptions") {
 		inv.RequiresOfflineHandling = true
+		inv.OfflineConflictPolicy = "SERVER_FIRST_WRITE_WINS"
 	}
 
 	// 4. Async operations
@@ -340,25 +381,38 @@ func normalizeInvariants(raw model.RawRequirement, promptLower string) model.Bus
 }
 
 // normalizeData extracts persistence requirements and ACID needs.
-func normalizeData(raw model.RawRequirement, promptLower string) model.DataProfile {
+func normalizeData(raw model.RawRequirement, promptLower string, inv model.BusinessInvariants) model.DataProfile {
 	data := model.DataProfile{
-		PrimaryStorage:    "RELATIONAL",
-		DailyVolumeMB:     100.0,
-		RequiresACID:      false,
-		HasHighContention: false,
-		RetentionDays:     90,
+		PrimaryStorage:       "RELATIONAL",
+		DailyVolumeMB:        100.0,
+		RequiresACID:         false,
+		TransactionScope:     "NONE",
+		AtomicOutboxRequired: false,
+		HasHighContention:    false,
+		RetentionDays:        90,
 	}
 
 	if strings.Contains(promptLower, "acid") || strings.Contains(promptLower, "payment") ||
 		strings.Contains(promptLower, "financial") || strings.Contains(promptLower, "ledger") ||
 		strings.Contains(promptLower, "balance") {
 		data.RequiresACID = true
+		data.TransactionScope = "PER_OPERATION_ATOMIC"
 	}
 
 	if strings.Contains(promptLower, "inventory") || strings.Contains(promptLower, "ticket booking") ||
 		strings.Contains(promptLower, "seat reservation") || strings.Contains(promptLower, "flash sale") {
 		data.HasHighContention = true
 		data.RequiresACID = true
+		data.TransactionScope = "PER_OPERATION_ATOMIC"
+	}
+
+	// Duplicate prevention and transactional outbox require atomic multi-step transactions
+	if inv.PreventDuplicates || len(inv.AsyncOperations) > 0 {
+		data.RequiresACID = true
+		data.TransactionScope = "PER_OPERATION_ATOMIC"
+	}
+	if len(inv.AsyncOperations) > 0 {
+		data.AtomicOutboxRequired = true
 	}
 
 	if strings.Contains(promptLower, "document") || strings.Contains(promptLower, "mongodb") {
@@ -368,6 +422,157 @@ func normalizeData(raw model.RawRequirement, promptLower string) model.DataProfi
 	}
 
 	return data
+}
+
+// buildFieldProvenance tracks origin, derivation method, and constraint status for parameters.
+func buildFieldProvenance(norm *model.NormalizedRequirements, promptLower string) map[string]model.ProvenanceMeta {
+	prov := make(map[string]model.ProvenanceMeta)
+
+	if norm.Traffic.TrafficSource == "EXPLICIT_RPS" {
+		prov["traffic.expected_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceUserProvided,
+			Method:           "Extracted directly from user prompt RPS specification",
+			IsHardConstraint: true,
+			Confidence:       1.0,
+		}
+		prov["traffic.peak_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           "Derived 3x burst multiplier over user-stated baseline RPS",
+			IsHardConstraint: false,
+			Confidence:       0.90,
+		}
+	} else if norm.Traffic.TrafficSource == "DERIVED_FROM_ARRIVALS" {
+		prov["traffic.expected_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           norm.Traffic.DerivedRPSReason,
+			IsHardConstraint: false,
+			Confidence:       0.85,
+		}
+		prov["traffic.peak_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           "Derived estimated peak HTTP RPS for concurrent QR scans, device retries, and dashboard refreshes",
+			IsHardConstraint: false,
+			Confidence:       0.85,
+		}
+	} else if norm.Traffic.TrafficSource == "DERIVED_FROM_DAU" {
+		prov["traffic.expected_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           norm.Traffic.DerivedRPSReason,
+			IsHardConstraint: false,
+			Confidence:       0.80,
+		}
+		prov["traffic.peak_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           "Derived 4x burst multiplier from DAU baseline traffic estimate",
+			IsHardConstraint: false,
+			Confidence:       0.80,
+		}
+	} else {
+		prov["traffic.expected_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceAssumedDefault,
+			Method:           "Assumed standard baseline traffic in absence of explicit volume metrics",
+			IsHardConstraint: false,
+			Confidence:       0.50,
+		}
+		prov["traffic.peak_rps"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceAssumedDefault,
+			Method:           "Heuristic 3x burst headroom over default baseline",
+			IsHardConstraint: false,
+			Confidence:       0.50,
+		}
+	}
+
+	if ratioRegex.MatchString(promptLower) {
+		prov["traffic.read_write_ratio"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceUserProvided,
+			Method:           "Extracted from explicit read-to-write ratio specification",
+			IsHardConstraint: true,
+			Confidence:       1.0,
+		}
+	} else if strings.Contains(promptLower, "read-heavy") || strings.Contains(promptLower, "write-heavy") {
+		prov["traffic.read_write_ratio"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           "Derived from stated workload bias (read-heavy or write-heavy)",
+			IsHardConstraint: false,
+			Confidence:       0.85,
+		}
+	} else {
+		prov["traffic.read_write_ratio"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceSystemDefault,
+			Method:           "Standard web application default read-write ratio (4:1)",
+			IsHardConstraint: false,
+			Confidence:       0.60,
+		}
+	}
+
+	prov["data.daily_volume_mb"] = model.ProvenanceMeta{
+		Source:           model.ProvenanceAssumedDefault,
+		Method:           "Default planning estimate for early-stage relational storage",
+		IsHardConstraint: false,
+		Confidence:       0.50,
+	}
+
+	prov["data.retention_days"] = model.ProvenanceMeta{
+		Source:           model.ProvenanceSystemDefault,
+		Method:           "Default operational data retention window (90 days) prior to cold archive",
+		IsHardConstraint: false,
+		Confidence:       0.50,
+	}
+
+	if strings.Contains(promptLower, "acid") {
+		prov["data.requires_acid"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceUserProvided,
+			Method:           "Explicitly required by user prompt",
+			IsHardConstraint: true,
+			Confidence:       1.0,
+		}
+	} else if norm.Invariants.PreventDuplicates || norm.Data.AtomicOutboxRequired {
+		prov["data.requires_acid"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceDerived,
+			Method:           "Derived from requirement for atomic transactional outbox and database-enforced duplicate prevention",
+			IsHardConstraint: true,
+			Confidence:       0.95,
+		}
+	} else {
+		prov["data.requires_acid"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceSystemDefault,
+			Method:           "ACID transactions not required for read-only or stateless workflows",
+			IsHardConstraint: false,
+			Confidence:       0.90,
+		}
+	}
+
+	if latencyMsRegex.MatchString(promptLower) {
+		prov["latency.p99_target_ms"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceUserProvided,
+			Method:           "Extracted directly from user-specified latency SLA",
+			IsHardConstraint: true,
+			Confidence:       1.0,
+		}
+	} else {
+		prov["latency.p99_target_ms"] = model.ProvenanceMeta{
+			Source:           model.ProvenanceSystemDefault,
+			Method:           "Standard web service P99 target budget (500ms)",
+			IsHardConstraint: false,
+			Confidence:       0.70,
+		}
+	}
+
+	prov["latency.p95_target_ms"] = model.ProvenanceMeta{
+		Source:           model.ProvenanceSystemDefault,
+		Method:           "Standard interactive web application P95 target budget (200ms)",
+		IsHardConstraint: false,
+		Confidence:       0.70,
+	}
+
+	prov["latency.max_acceptable_ms"] = model.ProvenanceMeta{
+		Source:           model.ProvenanceSystemDefault,
+		Method:           "System default request timeout threshold (2000ms)",
+		IsHardConstraint: false,
+		Confidence:       0.90,
+	}
+
+	return prov
 }
 
 // normalizeLatency extracts SLA and latency budgets.

@@ -26,6 +26,12 @@ func (g *Generator) Generate(
 	class *model.ClassificationResult,
 	summary *evaluator.DecisionSummary,
 ) (*model.ArchitectureContract, error) {
+	// Reconcile atomic requirements: outbox pattern requires atomic multi-step database transactions
+	if summary.RecommendedDataRules.RequiresOutboxPattern {
+		summary.RecommendedDataRules.RequiresACID = true
+		summary.RecommendedDataRules.TransactionPolicy.RequiresACID = true
+	}
+
 	contract := &model.ArchitectureContract{
 		ContractVersion: "1.0.0",
 		ProjectName:     req.ProjectName,
@@ -34,12 +40,16 @@ func (g *Generator) Generate(
 			Rationale:       summary.TopologyRationale,
 			ScalingStrategy: "HORIZONTALLY_STATELESS",
 		},
-		Components:            g.buildComponents(req, summary),
-		Data:                  summary.RecommendedDataRules,
-		Queue:                 summary.RecommendedQueueRules,
-		Constraints:           g.buildConstraints(summary),
+		Components:           g.buildComponents(req, summary),
+		Data:                 summary.RecommendedDataRules,
+		Queue:                summary.RecommendedQueueRules,
+		CapacityPlan:         summary.CapacityPlan,
+		OfflineSync:          summary.OfflineSync,
+		Constraints:          g.buildConstraints(summary),
 		RejectedAlternatives: g.rejectionGen.GenerateRejections(req, class, summary),
 		ValidationCriteria:   g.buildValidationCriteria(summary),
+		DecisionTraces:       summary.DecisionTraces,
+		FieldProvenance:      req.FieldProvenance,
 		ActiveAssumptions:    req.Assumptions,
 	}
 
@@ -90,7 +100,7 @@ func (g *Generator) buildComponents(req *model.NormalizedRequirements, summary *
 
 		components = append(components, model.ComponentDefinition{
 			Name:              workerName,
-			Responsibilities: responsibilities,
+			Responsibilities:  responsibilities,
 			Dependencies:      []string{coreName},
 			PersistenceAccess: true,
 		})
@@ -159,6 +169,22 @@ func (g *Generator) buildConstraints(summary *evaluator.DecisionSummary) []model
 		})
 	}
 
+	// 7. Offline synchronization constraint
+	if summary.OfflineSync != nil {
+		sev := "ERROR"
+		rule := "Buffer offline check-in events with client UUIDs; commit canonical attendance via database unique constraint and audit all attempts in scan_events"
+		if summary.OfflineSync.IsDefaultRecommendation {
+			sev = "WARNING"
+			rule = "Provisional recommendation: If offline scanning is required, buffer events with client UUIDs, commit canonical attendance via database unique constraint, and audit all attempts in scan_events"
+		}
+		constraints = append(constraints, model.ImplementationConstraint{
+			Rule:      rule,
+			Category:  "DATA_INTEGRITY",
+			Severity:  sev,
+			Rationale: "Prevents duplicate attendance records during network retries or offline reconnects while capturing full audit history for administrative reconciliation.",
+		})
+	}
+
 	return constraints
 }
 
@@ -198,6 +224,14 @@ func (g *Generator) buildValidationCriteria(summary *evaluator.DecisionSummary) 
 		criteria = append(criteria, model.ValidationCriterion{
 			Identifier:  "CHK-TRANSACTIONAL-OUTBOX",
 			Description: "Verify domain state updates and outbound event rows are inserted within the same database transaction",
+			IsAutomated: true,
+		})
+	}
+
+	if summary.OfflineSync != nil {
+		criteria = append(criteria, model.ValidationCriterion{
+			Identifier:  "CHK-OFFLINE-SYNC",
+			Description: "Verify offline check-in buffering uses client-generated UUIDs and preserves atomic database uniqueness",
 			IsAutomated: true,
 		})
 	}

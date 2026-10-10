@@ -23,8 +23,8 @@ func (g *RejectionGenerator) GenerateRejections(req *model.NormalizedRequirement
 		rejections = append(rejections, model.RejectedAlternative{
 			Pattern: "Microservices Architecture",
 			Reason: fmt.Sprintf(
-				"Rejected due to unwarranted operational and cognitive complexity. Baseline traffic (%0.0f RPS) and domain boundaries are fully satisfied by a Modular Monolith. Microservices would introduce network serialization latency, cross-service transaction failures, and multi-repo deployment overhead.",
-				req.Traffic.ExpectedRPS,
+				"Rejected due to operational and cognitive complexity under current team and deployment constraints (%s). Workload domain boundaries and traffic requirements are fully satisfied by a Modular Monolith. Microservices would introduce network serialization latency, cross-service transaction failure modes, and multi-service deployment overhead without justification.",
+				req.Constraints.DeploymentTarget,
 			),
 		})
 	}
@@ -33,10 +33,7 @@ func (g *RejectionGenerator) GenerateRejections(req *model.NormalizedRequirement
 	if summary.RecommendedQueueRules.QueueMechanism == "POSTGRES_SKIP_LOCKED" {
 		rejections = append(rejections, model.RejectedAlternative{
 			Pattern: "Dedicated Message Broker (Kafka / RabbitMQ / SQS)",
-			Reason: fmt.Sprintf(
-				"Rejected because peak throughput (%0.0f RPS) is well within PostgreSQL row-locking capacity (< 1,000 RPS). PostgreSQL SKIP LOCKED enables enqueuing background tasks atomically within the same ACID database transaction, avoiding dual-write failure modes and broker infrastructure maintenance.",
-				req.Traffic.PeakRPS,
-			),
+			Reason:  "Rejected to prevent distributed dual-write inconsistency and unnecessary infrastructure maintenance. PostgreSQL SKIP LOCKED enables enqueuing background tasks atomically within the local database transaction, guaranteeing outbox atomicity and bounded asynchronous processing without external broker clusters.",
 		})
 	}
 
@@ -44,7 +41,7 @@ func (g *RejectionGenerator) GenerateRejections(req *model.NormalizedRequirement
 	if summary.RecommendedDataRules.Locking == model.LockingPessimistic {
 		rejections = append(rejections, model.RejectedAlternative{
 			Pattern: "Optimistic Concurrency Control (Version tag retries)",
-			Reason: "Rejected due to high write contention on shared records (e.g. inventory or balances). Under burst concurrency, version collisions cause repeated application retry loops, degrading throughput and causing cascading tail-latency spikes.",
+			Reason:  "Rejected due to high write contention on shared records (e.g. inventory or balances). Under burst concurrency, version collisions cause repeated application retry loops, degrading throughput and causing cascading tail-latency spikes.",
 		})
 	}
 
@@ -52,7 +49,7 @@ func (g *RejectionGenerator) GenerateRejections(req *model.NormalizedRequirement
 	if summary.RecommendedDataRules.Locking == model.LockingOptimistic {
 		rejections = append(rejections, model.RejectedAlternative{
 			Pattern: "Pessimistic Concurrency Control (SELECT FOR UPDATE)",
-			Reason: "Rejected because concurrent write collisions are rare for this workload. Holding exclusive row locks would needlessly increase database lock contention and limit read scalability.",
+			Reason:  "Rejected because concurrent write collisions are rare for this workload. Holding exclusive row locks would needlessly increase database lock contention and limit read scalability.",
 		})
 	}
 
@@ -60,7 +57,7 @@ func (g *RejectionGenerator) GenerateRejections(req *model.NormalizedRequirement
 	if summary.RecommendedDataRules.RequiresOutboxPattern {
 		rejections = append(rejections, model.RejectedAlternative{
 			Pattern: "Synchronous External API Dispatch Inside Request Handler",
-			Reason: "Rejected because third-party network timeouts or outages would directly block client requests and risk database connection pool exhaustion. An asynchronous worker polling the Transactional Outbox provides resilient at-least-once delivery with jittered retries.",
+			Reason:  "Rejected because third-party network timeouts or outages would directly block client requests and risk database connection pool exhaustion. An asynchronous worker polling the Transactional Outbox provides resilient at-least-once delivery with jittered retries.",
 		})
 	}
 

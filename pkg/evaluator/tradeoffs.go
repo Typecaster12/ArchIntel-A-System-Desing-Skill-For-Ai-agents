@@ -55,6 +55,15 @@ type DecisionSummary struct {
 	// RecommendedQueueRules specifies background job, concurrency, and DLQ rules.
 	RecommendedQueueRules model.QueueRules `json:"recommended_queue_rules"`
 
+	// CapacityPlan documents connection pool sizing and concurrency limits using Little's Law.
+	CapacityPlan model.CapacityPlan `json:"capacity_plan"`
+
+	// OfflineSync documents offline synchronization semantics when offline handling is needed.
+	OfflineSync *model.OfflineSyncStrategy `json:"offline_sync,omitempty"`
+
+	// DecisionTraces connects major architectural decisions to explicit requirements and evidence.
+	DecisionTraces []model.DecisionTrace `json:"decision_traces,omitempty"`
+
 	// SelectedPatterns lists patterns incorporated into the design.
 	SelectedPatterns []CandidateEvaluation `json:"selected_patterns"`
 }

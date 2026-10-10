@@ -37,17 +37,18 @@ func TestContractJSONSerializationAndValidation(t *testing.T) {
 		Data: DataRules{
 			IsolationLevel:         "READ_COMMITTED",
 			Locking:                LockingPessimistic,
+			RequiresACID:           true,
 			RequiresIdempotencyKey: true,
 			RequiresOutboxPattern:  true,
 			ConnectionPoolMax:      25,
 		},
 		Queue: QueueRules{
-			Enabled:               true,
-			QueueMechanism:        "POSTGRES_SKIP_LOCKED",
+			Enabled:              true,
+			QueueMechanism:       "POSTGRES_SKIP_LOCKED",
 			MaxWorkerConcurrency: 10,
-			MaxRetryAttempts:      5,
-			BackoffStrategy:       "EXPONENTIAL_WITH_JITTER",
-			DeadLetterHandling:    "Store in failed_jobs table and fire alert",
+			MaxRetryAttempts:     5,
+			BackoffStrategy:      "EXPONENTIAL_WITH_JITTER",
+			DeadLetterHandling:   "Store in failed_jobs table and fire alert",
 		},
 		Constraints: []ImplementationConstraint{
 			{
@@ -145,7 +146,7 @@ func TestContractValidationErrors(t *testing.T) {
 			mutate: func(c *ArchitectureContract) {
 				c.Data.RequiresOutboxPattern = false
 				c.Components = append(c.Components, ComponentDefinition{
-					Name: "OutboxDispatcherWorker",
+					Name:             "OutboxDispatcherWorker",
 					Responsibilities: []string{"Poll transactional outbox table"},
 				})
 			},
@@ -156,11 +157,96 @@ func TestContractValidationErrors(t *testing.T) {
 			mutate: func(c *ArchitectureContract) {
 				c.Queue.Enabled = false
 				c.Components = append(c.Components, ComponentDefinition{
-					Name: "AsyncWorker",
+					Name:             "AsyncWorker",
 					Responsibilities: []string{"Process background tasks"},
 				})
 			},
 			wantErr: "contract contradiction: component \"AsyncWorker\" defined while queue.enabled is false",
+		},
+		{
+			name: "ACID Outbox Contradiction: outbox is true but requires_acid is false",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresOutboxPattern = true
+				c.Data.RequiresACID = false
+				c.Data.TransactionPolicy.RequiresACID = false
+			},
+			wantErr: "contract contradiction: data.requires_outbox_pattern is true but data.requires_acid is false (outbox requires atomic multi-step database transactions)",
+		},
+		{
+			name: "Idempotency Rule Agreement: requires_idempotency_key without constraint",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.RequiresIdempotencyKey = true
+				c.Constraints = []ImplementationConstraint{}
+			},
+			wantErr: "contract contradiction: data.requires_idempotency_key is true but no idempotency constraint is defined",
+		},
+		{
+			name: "Uniqueness Agreement: uniqueness_strategy without unique constraint",
+			mutate: func(c *ArchitectureContract) {
+				c.Data.UniquenessStrategy = "DATABASE_UNIQUE_CONSTRAINT"
+				c.Constraints = []ImplementationConstraint{}
+			},
+			wantErr: "contract contradiction: data.uniqueness_strategy is defined but no uniqueness constraint is included",
+		},
+		{
+			name: "At-least-once delivery without worker idempotency or deduplication",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 5
+				c.Queue.DeliveryGuarantee = "AT_LEAST_ONCE"
+				c.Constraints = []ImplementationConstraint{}
+			},
+			wantErr: "contract contradiction: queue delivery guarantee is AT_LEAST_ONCE but no worker idempotency or deduplication strategy is documented",
+		},
+		{
+			name: "Queue retry without dead letter handling",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 5
+				c.Queue.MaxRetryAttempts = 3
+				c.Queue.DeadLetterHandling = ""
+			},
+			wantErr: "contract contradiction: queue retries are enabled but queue.dead_letter_handling is undefined",
+		},
+		{
+			name: "Queue concurrency unbounded (<= 0)",
+			mutate: func(c *ArchitectureContract) {
+				c.Queue.Enabled = true
+				c.Queue.MaxWorkerConcurrency = 0
+			},
+			wantErr: "contract contradiction: queue is enabled but queue.max_worker_concurrency is not bounded (must be > 0)",
+		},
+		{
+			name: "External call prohibited in transaction while responsibility places it inside tx",
+			mutate: func(c *ArchitectureContract) {
+				c.Constraints = append(c.Constraints, ImplementationConstraint{
+					Rule: "Do not perform external network calls inside an active database transaction",
+				})
+				c.Components = []ComponentDefinition{
+					{
+						Name: "PaymentGatewayModule",
+						Responsibilities: []string{
+							"Call external payment gateway inside DB tx to charge card",
+						},
+					},
+				}
+			},
+			wantErr: "contract contradiction: component \"PaymentGatewayModule\" responsibility \"Call external payment gateway inside DB tx to charge card\" places external network call inside DB transaction, violating constraint",
+		},
+		{
+			name: "Offline handling in component without offline_sync policy",
+			mutate: func(c *ArchitectureContract) {
+				c.Components = []ComponentDefinition{
+					{
+						Name: "ScannerModule",
+						Responsibilities: []string{
+							"Buffer offline check-in scans on mobile device",
+						},
+					},
+				}
+				c.OfflineSync = nil
+			},
+			wantErr: "contract contradiction: component \"ScannerModule\" supports offline check-in but contract.offline_sync policy is missing",
 		},
 	}
 

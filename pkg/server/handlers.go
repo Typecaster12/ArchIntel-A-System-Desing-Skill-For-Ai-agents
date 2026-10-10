@@ -68,7 +68,7 @@ func (h *Handler) RecommendArchitecture(w http.ResponseWriter, r *http.Request) 
 
 // ValidateRequest defines the payload for POST /api/v1/validate.
 type ValidateRequest struct {
-	Contract model.ArchitectureContract     `json:"contract"`
+	Contract model.ArchitectureContract       `json:"contract"`
 	Proposal validator.ImplementationProposal `json:"proposal"`
 }
 

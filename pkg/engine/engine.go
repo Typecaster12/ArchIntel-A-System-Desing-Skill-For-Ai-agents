@@ -15,9 +15,9 @@ import (
 
 // EngineOptions configures the Engine components.
 type EngineOptions struct {
-	Classifier          classifier.Classifier
-	PatternCatalog      *knowledge.Catalog
-	AntiPatternCatalog  *knowledge.AntiPatternCatalog
+	Classifier         classifier.Classifier
+	PatternCatalog     *knowledge.Catalog
+	AntiPatternCatalog *knowledge.AntiPatternCatalog
 }
 
 // Engine coordinates the entire 7-stage architectural decision pipeline.
@@ -64,7 +64,7 @@ func NewEngine(opts EngineOptions) *Engine {
 // AnalysisResponse holds requirement normalization and gap analysis output.
 type AnalysisResponse struct {
 	Normalized *model.NormalizedRequirements `json:"normalized"`
-	Gaps       *normalizer.GapAnalysis        `json:"gaps"`
+	Gaps       *normalizer.GapAnalysis       `json:"gaps"`
 }
 
 // RecommendationResponse holds the full architectural recommendation and contract.
@@ -80,7 +80,7 @@ type RecommendationResponse struct {
 
 // TradeoffResponse holds multi-criteria candidate rankings and rejection rationales.
 type TradeoffResponse struct {
-	DecisionSummary      *evaluator.DecisionSummary   `json:"decision_summary"`
+	DecisionSummary      *evaluator.DecisionSummary  `json:"decision_summary"`
 	RejectedAlternatives []model.RejectedAlternative `json:"rejected_alternatives"`
 }
 

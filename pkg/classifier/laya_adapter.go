@@ -57,18 +57,18 @@ func NewLayaAdapter(cfg LayaConfig) *LayaAdapter {
 
 // LayaClassificationPayload defines the JSON body sent to the LAYA decision endpoint.
 type LayaClassificationPayload struct {
-	ProjectName string `json:"project_name"`
-	Domain      string `json:"domain"`
-	Summary     string `json:"summary"`
-	ExpectedRPS float64 `json:"expected_rps"`
-	IsBursty    bool   `json:"is_bursty"`
-	RequiresACID bool  `json:"requires_acid"`
+	ProjectName  string  `json:"project_name"`
+	Domain       string  `json:"domain"`
+	Summary      string  `json:"summary"`
+	ExpectedRPS  float64 `json:"expected_rps"`
+	IsBursty     bool    `json:"is_bursty"`
+	RequiresACID bool    `json:"requires_acid"`
 }
 
 // LayaClassificationResponse defines the expected JSON response from the LAYA model.
 type LayaClassificationResponse struct {
-	ModelVersion string             `json:"model_version"`
-	LatencyMs    int64              `json:"latency_ms"`
+	ModelVersion  string             `json:"model_version"`
+	LatencyMs     int64              `json:"latency_ms"`
 	Probabilities map[string]float64 `json:"probabilities"`
 }
 
@@ -88,11 +88,11 @@ func (a *LayaAdapter) Classify(ctx context.Context, req *model.NormalizedRequire
 	}
 
 	payload := LayaClassificationPayload{
-		ProjectName: req.ProjectName,
-		Domain:      string(req.Domain),
-		Summary:     req.Summary,
-		ExpectedRPS: req.Traffic.ExpectedRPS,
-		IsBursty:    req.Traffic.IsBursty,
+		ProjectName:  req.ProjectName,
+		Domain:       string(req.Domain),
+		Summary:      req.Summary,
+		ExpectedRPS:  req.Traffic.ExpectedRPS,
+		IsBursty:     req.Traffic.IsBursty,
 		RequiresACID: req.Data.RequiresACID,
 	}
 
